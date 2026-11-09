@@ -203,6 +203,11 @@ dependencies = [
 [[package]]
 name = "damper-shim"
 version = "0.1.0"
+dependencies = [
+ "damper-core",
+ "damper-proto",
+ "tempfile",
+]
 
 [[package]]
 name = "damperd"

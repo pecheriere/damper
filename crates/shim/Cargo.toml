@@ -9,3 +9,10 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+damper-core = { version = "0.1.0", path = "../core" }
+damper-proto = { version = "0.1.0", path = "../proto" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
