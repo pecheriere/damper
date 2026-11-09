@@ -9,3 +9,10 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+thiserror = "2.0.21"
+toml = "1.2.1"
+
+[dev-dependencies]
+proptest = "1.12.0"
