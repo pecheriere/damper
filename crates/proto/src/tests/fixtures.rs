@@ -163,7 +163,10 @@ pub fn server_msgs() -> Vec<ServerMsg> {
         ServerMsg::Error {
             message: "e".into(),
         },
-        ServerMsg::Events { events: Vec::new() },
+        ServerMsg::Events {
+            events: Vec::new(),
+            truncated: true,
+        },
     ];
     msgs.push(ServerMsg::Events {
         events: event_kinds()
@@ -174,6 +177,7 @@ pub fn server_msgs() -> Vec<ServerMsg> {
                 kind,
             })
             .collect(),
+        truncated: false,
     });
     msgs
 }

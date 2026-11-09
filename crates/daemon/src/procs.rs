@@ -89,6 +89,13 @@ pub fn process_name(pid: u32) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The parent pid of process `pid`, or `None` when it is gone or unreadable.
+#[must_use]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let bsd = pidinfo::<BSDInfo>(i32::try_from(pid).ok()?, 0).ok()?;
+    Some(bsd.pbi_ppid)
+}
+
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test")]
 mod tests {
@@ -113,6 +120,17 @@ mod tests {
         assert!(me.peak >= me.footprint);
         assert_eq!(me.ppid, getppid().as_raw().unsigned_abs());
         assert_ne!(me.name, "");
+    }
+
+    #[test]
+    fn parent_pid_reads_the_real_parent() {
+        let me = getpid().as_raw().unsigned_abs();
+        assert_eq!(parent_pid(me), Some(getppid().as_raw().unsigned_abs()));
+        let mut child = Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        assert_eq!(parent_pid(child.id()), Some(me));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(parent_pid(child.id()), None);
     }
 
     #[test]

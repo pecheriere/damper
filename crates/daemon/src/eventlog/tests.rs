@@ -146,3 +146,72 @@ fn log_files_are_private() {
         .mode();
     assert_eq!(mode & 0o777, 0o600);
 }
+
+#[test]
+fn a_torn_last_line_does_not_swallow_the_next_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = EventLog::open(dir.path()).unwrap();
+    log.append(err(1)).unwrap();
+    drop(log);
+    // A crash mid-write left half a line without its newline.
+    append_raw(&dir.path().join("events.jsonl"), b"{\"ts_ms\":3,\"ty");
+    let mut log = EventLog::open(dir.path()).unwrap();
+    log.append(err(2)).unwrap();
+    assert_eq!(messages(&log.read(None).unwrap()), ["e1", "e2"]);
+}
+
+fn shim_line(ts: u64) -> String {
+    format!(
+        "{{\"ts_ms\":{ts},\"type\":\"shim_fallback\",\"reason\":\"r{ts}\",\"cwd\":\"/src/app\"}}\n"
+    )
+}
+
+#[test]
+fn an_unreadable_leftover_is_set_aside_and_ingest_carries_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let fallbacks = dir.path().join("fallbacks.jsonl");
+    let leftover = dir.path().join("fallbacks.jsonl.ingest");
+    // O_NOFOLLOW refuses a symlink with ELOOP.
+    std::os::unix::fs::symlink(dir.path().join("elsewhere"), &leftover).unwrap();
+    append_raw(&fallbacks, shim_line(5).as_bytes());
+
+    let mut log = EventLog::open(dir.path()).unwrap();
+    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 1);
+    assert!(
+        dir.path()
+            .join("fallbacks.jsonl.bad")
+            .symlink_metadata()
+            .is_ok()
+    );
+    assert!(leftover.symlink_metadata().is_err());
+    let events = log.read(None).unwrap();
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::Error { message } if message.contains("fallbacks.jsonl.ingest")
+    )));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::ShimFallback { .. }) && e.ts_ms == 5)
+    );
+    // The next start is not stuck on it.
+    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 0);
+}
+
+#[test]
+fn ingest_skips_lines_longer_than_max_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fallbacks = dir.path().join("fallbacks.jsonl");
+    append_raw(&fallbacks, shim_line(1).as_bytes());
+    let mut oversized = shim_line(2).into_bytes();
+    oversized.pop();
+    oversized.splice(1..1, vec![b' '; damper_proto::MAX_LINE]);
+    oversized.push(b'\n');
+    append_raw(&fallbacks, &oversized);
+    append_raw(&fallbacks, shim_line(3).as_bytes());
+
+    let mut log = EventLog::open(dir.path()).unwrap();
+    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 2);
+    let stamps: Vec<u64> = log.read(None).unwrap().iter().map(|e| e.ts_ms).collect();
+    assert_eq!(stamps, [1, 3]);
+}

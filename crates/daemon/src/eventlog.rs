@@ -7,11 +7,11 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use damper_proto::{Event, EventKind};
+use damper_proto::{Event, EventKind, MAX_LINE};
 use nix::libc;
 
 /// The size at which the current file is rotated: 10 MiB.
@@ -84,8 +84,21 @@ impl EventLog {
     /// # Errors
     /// Failure to open the file or read its size.
     pub fn open_with_limit(dir: &Path, limit: u64) -> io::Result<Self> {
-        let file = open_append(&dir.join(FILE_NAME))?;
-        let size = file.metadata()?.len();
+        let path = dir.join(FILE_NAME);
+        let mut file = open_append(&path)?;
+        let mut size = file.metadata()?.len();
+        // A crash mid-write can leave a last line without its newline; end
+        // it, so the next event starts a line of its own.
+        if let Some(last) = size.checked_sub(1)
+            && let Some(reader) = open_read(&path)?
+        {
+            let mut byte = [0_u8; 1];
+            reader.read_exact_at(&mut byte, last)?;
+            if byte != *b"\n" {
+                file.write_all(b"\n")?;
+                size += 1;
+            }
+        }
         Ok(Self {
             dir: dir.to_path_buf(),
             file,
@@ -164,41 +177,130 @@ impl EventLog {
     /// Other lines are skipped, so the shim's file cannot forge other events.
     /// The file is first renamed to `<path>.ingest` so that a shim appending
     /// meanwhile starts a new file instead of losing its line; a `.ingest`
-    /// file left by an interrupted run is taken first.
+    /// file left by an interrupted run is taken first. Lines longer than
+    /// [`MAX_LINE`] are skipped. A file that can't be opened or read is
+    /// logged as `Error` and renamed to `<path>.bad`, and ingesting carries
+    /// on, so a bad leftover cannot fail every start.
     ///
     /// # Errors
-    /// Failure to rename, read or remove the file, or to append.
+    /// Failure to rename or remove the file, or to append.
     pub fn ingest_fallbacks(&mut self, path: &Path) -> io::Result<u32> {
-        let mut taking = path.as_os_str().to_owned();
-        taking.push(".ingest");
-        let taking = PathBuf::from(taking);
-        let leftover = self.ingest_file(&taking)?;
+        let with_suffix = |suffix: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let taking = with_suffix(".ingest");
+        let bad = with_suffix(".bad");
+        let leftover = self.ingest_file(&taking, &bad)?;
         match fs::rename(path, &taking) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(leftover),
             other => other?,
         }
-        Ok(leftover.saturating_add(self.ingest_file(&taking)?))
+        Ok(leftover.saturating_add(self.ingest_file(&taking, &bad)?))
     }
 
-    /// Ingests and removes `path`, if it exists.
-    fn ingest_file(&mut self, path: &Path) -> io::Result<u32> {
-        let Some(file) = open_read(path)? else {
-            return Ok(0);
+    /// Ingests and removes `path`, if it exists. A file that can't be read
+    /// is logged and renamed to `bad`, so it cannot stop every later start.
+    fn ingest_file(&mut self, path: &Path, bad: &Path) -> io::Result<u32> {
+        let file = match open_read(path) {
+            Ok(None) => return Ok(0),
+            Ok(Some(file)) => file,
+            Err(e) => return self.set_aside(path, bad, &e),
         };
-        let count = self.take_fallbacks(file)?;
+        let count = match self.take_fallbacks(file) {
+            Ok(count) => count,
+            Err(IngestError::Read(e)) => return self.set_aside(path, bad, &e),
+            Err(IngestError::Write(e)) => return Err(e),
+        };
         fs::remove_file(path)?;
         Ok(count)
     }
 
-    fn take_fallbacks(&mut self, file: File) -> io::Result<u32> {
+    fn set_aside(&mut self, path: &Path, bad: &Path, cause: &io::Error) -> io::Result<u32> {
+        let message = match fs::rename(path, bad) {
+            Ok(()) => format!(
+                "reading {}: {cause}; moved it to {}",
+                path.display(),
+                bad.display()
+            ),
+            Err(e) => format!(
+                "reading {}: {cause}; moving it aside failed too: {e}",
+                path.display()
+            ),
+        };
+        self.append(EventKind::Error { message })?;
+        Ok(0)
+    }
+
+    fn take_fallbacks(&mut self, file: File) -> Result<u32, IngestError> {
         let mut count: u32 = 0;
-        for event in parse_lines(file)? {
-            if matches!(event.kind, EventKind::ShimFallback { .. }) {
+        for_each_line(BufReader::new(file), MAX_LINE, |line| {
+            if let Ok(event) = serde_json::from_slice::<Event>(line)
+                && matches!(event.kind, EventKind::ShimFallback { .. })
+            {
                 self.write_event(&event)?;
                 count = count.saturating_add(1);
             }
-        }
+            Ok(())
+        })?;
         Ok(count)
+    }
+}
+
+/// Why ingesting a fallback file stopped.
+#[derive(Debug)]
+enum IngestError {
+    /// The shim's file could not be read.
+    Read(io::Error),
+    /// The event log could not be written.
+    Write(io::Error),
+}
+
+/// Calls `f` with every line of `reader` that, with its newline, is at most
+/// `max` bytes (passed without the newline). Longer lines are skipped
+/// without ever buffering more than `max + 1` bytes of them.
+fn for_each_line(
+    mut reader: impl BufRead,
+    max: usize,
+    mut f: impl FnMut(&[u8]) -> io::Result<()>,
+) -> Result<(), IngestError> {
+    let mut line = Vec::new();
+    let mut skipping = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(IngestError::Read(e)),
+        };
+        if available.is_empty() {
+            // A last line without a newline is still offered.
+            if !skipping && !line.is_empty() {
+                f(&line).map_err(IngestError::Write)?;
+            }
+            return Ok(());
+        }
+        let (take, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
+        };
+        if !skipping {
+            let room = max.saturating_add(1).saturating_sub(line.len());
+            line.extend_from_slice(&available[..take.min(room)]);
+            if line.len() > max {
+                skipping = true;
+                line.clear();
+            }
+        }
+        reader.consume(take);
+        if done {
+            if !skipping {
+                line.pop();
+                f(&line).map_err(IngestError::Write)?;
+            }
+            line.clear();
+            skipping = false;
+        }
     }
 }
 

@@ -11,20 +11,20 @@
 //! FIFO, then drops every connection (shims feed their own FIFOs), removes
 //! the socket and leaves the FIFOs in place for the shims still using them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use damper_core::broker::{Broker, MAX_SESSIONS};
 use damper_core::config::Machine;
-use damper_proto::EventKind;
 use damper_proto::paths::{Paths, prepare_dirs};
+use damper_proto::{EventKind, MAX_REPLY};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
 use nix::libc;
@@ -37,14 +37,14 @@ use crate::engine::{ConfigWatch, Engine};
 use crate::eventlog::EventLog;
 use crate::fifo::sweep_stale_fifos;
 use crate::pidwatch::PidWatcher;
-use crate::server::{Shared, serve};
+use crate::server::{FIRST_LINE_TIMEOUT, Shared, serve};
 use crate::sources::{MemorySource, ProcessSource};
 
 /// Connections served at once; beyond that a connection is closed at once
 /// and logged. Room for every session plus CLI clients.
 const MAX_CONNECTIONS: usize = MAX_SESSIONS * 2;
 /// The pause after a failed `accept`.
-const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Requests queued for the broker task.
 const REQUEST_QUEUE: usize = 256;
 
@@ -53,12 +53,18 @@ const REQUEST_QUEUE: usize = 256;
 pub struct Options {
     /// The session cap.
     pub max_sessions: usize,
+    /// The longest `Status` or `Events` reply line.
+    pub max_reply: usize,
+    /// How long a new connection may take to send its first line.
+    pub first_line_timeout: Duration,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             max_sessions: MAX_SESSIONS,
+            max_reply: MAX_REPLY,
+            first_line_timeout: FIRST_LINE_TIMEOUT,
         }
     }
 }
@@ -192,6 +198,17 @@ fn write_events(events: &Mutex<EventLog>, mut rx: mpsc::UnboundedReceiver<EventK
     }
 }
 
+/// Logs a connection task that panicked; one that returned needs nothing.
+fn note_ended(shared: &Shared, joined: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = joined
+        && e.is_panic()
+    {
+        shared.log(EventKind::Error {
+            message: "a connection task panicked".to_owned(),
+        });
+    }
+}
+
 async fn serve_all(
     paths: &Paths,
     memory: Arc<dyn MemorySource>,
@@ -247,6 +264,8 @@ async fn serve_all(
         config,
         memory_failing: false,
         procs_failing: false,
+        fill_failing: HashSet::new(),
+        polled: HashSet::new(),
     };
     engine.tick().await;
 
@@ -256,6 +275,8 @@ async fn serve_all(
         log,
         events: Arc::clone(events),
         own_uid: getuid().as_raw(),
+        max_reply: opts.max_reply,
+        first_line_timeout: opts.first_line_timeout,
     });
     let mut broker_task = Box::pin(engine.run(requests_rx, exits));
     let mut shutdown = std::pin::pin!(shutdown);
@@ -286,7 +307,7 @@ async fn serve_all(
                     tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
             },
-            Some(_) = conns.join_next(), if !conns.is_empty() => {}
+            Some(joined) = conns.join_next(), if !conns.is_empty() => note_ended(&shared, joined),
         }
     };
     // Broker first: from here no closed connection can remove a FIFO.

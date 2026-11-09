@@ -13,26 +13,29 @@ use std::time::Duration;
 use damper_core::broker::OpenRequest;
 use damper_core::classify::Kind;
 use damper_proto::{
-    ClientMsg, Event, EventKind, MAX_LINE, ProtoError, ServerMsg, SessionId, Status, decode,
-    encode, explain_events,
+    ClientMsg, Event, EventKind, MAX_LINE, ServerMsg, SessionId, Status, decode, explain_events,
 };
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::eventlog::EventLog;
-use crate::procs::process_name;
+use crate::procs::{parent_pid, process_name};
 
-/// The longest a write to a client may take before the connection is dropped.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+mod checks;
+mod wire;
+
+pub use checks::peer_allowed;
+use checks::{decode_error_reason, never_hold, started_allowed};
+use wire::{LineError, next_line, write_msg};
+
+/// How long a new connection has to send its first complete line.
+pub const FIRST_LINE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Messages queued for one session's client; a client that lets this many
 /// pile up is not reading and is disconnected.
 pub(crate) const CLIENT_QUEUE: usize = 64;
-
-/// The name of the parent process whose builds are never held (spec §5.4).
-const NEVER_HOLD_PARENT: &str = "rust-analyzer";
 
 /// Sends events to the event-log writer.
 pub(crate) type LogTx = mpsc::UnboundedSender<EventKind>;
@@ -61,6 +64,10 @@ pub(crate) struct Shared {
     pub(crate) log: LogTx,
     pub(crate) events: Arc<Mutex<EventLog>>,
     pub(crate) own_uid: u32,
+    /// The longest `Status` or `Events` reply line.
+    pub(crate) max_reply: usize,
+    /// How long a connection may stay silent before its first line.
+    pub(crate) first_line_timeout: Duration,
 }
 
 impl Shared {
@@ -72,87 +79,6 @@ impl Shared {
     fn reject(&self, reason: String) {
         self.log(EventKind::ClientRejected { reason });
     }
-}
-
-/// Only the daemon's own user may connect.
-#[must_use]
-pub fn peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
-    peer_uid == own_uid
-}
-
-/// Why a line could not be read.
-#[derive(Debug)]
-enum LineError {
-    TooLong,
-    Io,
-}
-
-/// Reads the next line into `buf` (cleared first if it held a whole line).
-///
-/// Cancel-safe: bytes are moved into `buf` only after `fill_buf` returns, so
-/// a cancelled call loses nothing and the next call carries on. `Ok(false)`
-/// means the peer closed the connection (a partial last line is dropped).
-async fn next_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    buf: &mut Vec<u8>,
-) -> Result<bool, LineError> {
-    if buf.last() == Some(&b'\n') {
-        buf.clear();
-    }
-    loop {
-        let available = reader.fill_buf().await.map_err(|_| LineError::Io)?;
-        if available.is_empty() {
-            return Ok(false);
-        }
-        let (take, done) = match available.iter().position(|&b| b == b'\n') {
-            Some(i) => (i + 1, true),
-            None => (available.len(), false),
-        };
-        let room = (MAX_LINE + 1).saturating_sub(buf.len());
-        buf.extend_from_slice(&available[..take.min(room)]);
-        reader.consume(take);
-        if buf.len() > MAX_LINE {
-            return Err(LineError::TooLong);
-        }
-        if done {
-            return Ok(true);
-        }
-    }
-}
-
-async fn write_msg(w: &mut OwnedWriteHalf, msg: &ServerMsg) -> Result<(), ()> {
-    let line = match msg {
-        ServerMsg::Events { events } => fit_events(events),
-        other => encode(other),
-    }
-    .map_err(|_| ())?;
-    match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&line)).await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(()),
-    }
-}
-
-/// Room left in a line for the envelope around the events:
-/// `{"v":1,"type":"events","events":[` … `]}` and the newline.
-const EVENTS_ENVELOPE: usize = 64;
-
-/// Encodes `Events` with the newest events that fit in [`MAX_LINE`]: a long
-/// history is cut from its oldest end, so a reply always carries the latest.
-fn fit_events(events: &[Event]) -> Result<Vec<u8>, ProtoError> {
-    let mut budget = MAX_LINE - EVENTS_ENVELOPE;
-    let mut start = events.len();
-    while let Some(index) = start.checked_sub(1) {
-        // One more byte for the separating comma.
-        let len = serde_json::to_vec(&events[index])?.len() + 1;
-        if len > budget {
-            break;
-        }
-        budget -= len;
-        start = index;
-    }
-    encode(&ServerMsg::Events {
-        events: events[start..].to_vec(),
-    })
 }
 
 /// Serves one accepted connection until it closes or breaks the protocol.
@@ -174,6 +100,7 @@ pub(crate) async fn serve(stream: UnixStream, shared: Arc<Shared>) {
         reader: BufReader::new(r),
         writer: w,
         buf: Vec::new(),
+        greeted: false,
         session: None,
         peer_pid,
         shared,
@@ -189,6 +116,8 @@ struct Conn {
     reader: BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: OwnedWriteHalf,
     buf: Vec<u8>,
+    /// Whether the client has sent a complete line yet.
+    greeted: bool,
     session: Option<(SessionId, mpsc::Receiver<ServerMsg>)>,
     peer_pid: Option<u32>,
     shared: Arc<Shared>,
@@ -207,18 +136,30 @@ impl Conn {
                 tokio::select! {
                     msg = rx.recv() => {
                         let Some(msg) = msg else { return };
-                        if write_msg(&mut self.writer, &msg).await.is_err() {
+                        if self.write(msg).await.is_err() {
                             return;
                         }
                         continue;
                     }
                     line = next_line(&mut self.reader, &mut self.buf) => line,
                 }
-            } else {
+            } else if self.greeted {
                 next_line(&mut self.reader, &mut self.buf).await
+            } else {
+                let timeout = self.shared.first_line_timeout;
+                let first = next_line(&mut self.reader, &mut self.buf);
+                let Ok(line) = tokio::time::timeout(timeout, first).await else {
+                    return self
+                        .reject(format!(
+                            "no complete request within {} ms",
+                            timeout.as_millis()
+                        ))
+                        .await;
+                };
+                line
             };
             match line {
-                Ok(true) => {}
+                Ok(true) => self.greeted = true,
                 Ok(false) | Err(LineError::Io) => return,
                 Err(LineError::TooLong) => {
                     return self
@@ -228,7 +169,7 @@ impl Conn {
             }
             let msg = match decode::<ClientMsg>(&self.buf) {
                 Ok(msg) => msg,
-                Err(e) => return self.reject(e.to_string()).await,
+                Err(e) => return self.reject(decode_error_reason(&e)).await,
             };
             if matches!(self.handle(msg).await, Next::Close) {
                 return;
@@ -239,18 +180,20 @@ impl Conn {
     /// Sends `Error`, logs `ClientRejected`; the caller then closes.
     async fn reject(&mut self, reason: String) {
         // The connection closes next whether or not the client got the line.
-        let _ = write_msg(
-            &mut self.writer,
-            &ServerMsg::Error {
+        let _ = self
+            .write(ServerMsg::Error {
                 message: reason.clone(),
-            },
-        )
-        .await;
+            })
+            .await;
         self.shared.reject(reason);
     }
 
-    async fn reply(&mut self, msg: &ServerMsg) -> Next {
-        match write_msg(&mut self.writer, msg).await {
+    async fn write(&mut self, msg: ServerMsg) -> Result<(), ()> {
+        write_msg(&mut self.writer, msg, self.shared.max_reply).await
+    }
+
+    async fn reply(&mut self, msg: ServerMsg) -> Next {
+        match self.write(msg).await {
             Ok(()) => Next::Continue,
             Err(()) => Next::Close,
         }
@@ -270,7 +213,7 @@ impl Conn {
                     return Next::Close;
                 }
                 match rx.await {
-                    Ok(status) => self.reply(&ServerMsg::Status(status)).await,
+                    Ok(status) => self.reply(ServerMsg::Status(status)).await,
                     Err(_) => Next::Close,
                 }
             }
@@ -295,7 +238,9 @@ impl Conn {
                 cwd,
                 subcommand,
                 shim_pid,
-                parent_pid,
+                // The client's word is not trusted for `never_hold`: the
+                // daemon looks up the connecting shim's real parent.
+                parent_pid: _,
                 nested,
             } => {
                 if self.session.is_some() {
@@ -313,7 +258,7 @@ impl Conn {
                     kind: Kind::from_subcommand(&subcommand),
                     subcommand,
                     shim_pid,
-                    never_hold: process_name(parent_pid).as_deref() == Some(NEVER_HOLD_PARENT),
+                    never_hold: never_hold(self.shim_parent_name().as_deref()),
                     nested,
                 };
                 self.open(req).await
@@ -324,6 +269,13 @@ impl Conn {
                     return Next::Close;
                 };
                 let session = session.clone();
+                // An open session means the peer pid was read and checked.
+                let shim_pid = self.peer_pid.unwrap_or_default();
+                if !started_allowed(parent_pid(cargo_pid), shim_pid) {
+                    self.reject("cargo_pid is not a child of the shim".to_owned())
+                        .await;
+                    return Next::Close;
+                }
                 match self
                     .shared
                     .requests
@@ -356,11 +308,16 @@ impl Conn {
             }
             Ok(Err(message)) => {
                 // The broker already logged why; tell the shim to fall back.
-                let _ = write_msg(&mut self.writer, &ServerMsg::Error { message }).await;
+                let _ = self.write(ServerMsg::Error { message }).await;
                 Next::Close
             }
             Err(_) => Next::Close,
         }
+    }
+
+    /// The name of the connecting process's parent, from the process table.
+    fn shim_parent_name(&self) -> Option<String> {
+        self.peer_pid.and_then(parent_pid).and_then(process_name)
     }
 
     async fn read_events(&self, since_ms: Option<u64>) -> Result<Vec<Event>, String> {
@@ -378,8 +335,14 @@ impl Conn {
 
     async fn reply_events(&mut self, events: Result<Vec<Event>, String>) -> Next {
         match events {
-            Ok(events) => self.reply(&ServerMsg::Events { events }).await,
-            Err(message) => self.reply(&ServerMsg::Error { message }).await,
+            Ok(events) => {
+                self.reply(ServerMsg::Events {
+                    events,
+                    truncated: false,
+                })
+                .await
+            }
+            Err(message) => self.reply(ServerMsg::Error { message }).await,
         }
     }
 }

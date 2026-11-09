@@ -5,7 +5,7 @@
 //! client whose queue is full loses its connection. A failing action is
 //! logged as `Error` and never stops the daemon.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +21,8 @@ use crate::fifo::SessionFifo;
 use crate::pidwatch::PidWatcher;
 use crate::server::{LogTx, Request};
 use crate::sources::{MemorySource, ProcessSource, Snapshot};
+
+mod liveness;
 
 /// The broker's sampling and policy interval.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -98,6 +100,11 @@ pub(crate) struct Engine {
     /// failure is logged once rather than every second.
     pub(crate) memory_failing: bool,
     pub(crate) procs_failing: bool,
+    /// Sessions whose FIFO could not be read last tick, so a lasting failure
+    /// is logged once.
+    pub(crate) fill_failing: HashSet<SessionId>,
+    /// Pids the watcher refused, checked for exit every tick instead.
+    pub(crate) polled: HashSet<u32>,
 }
 
 impl Engine {
@@ -192,11 +199,11 @@ impl Engine {
                 return;
             }
         };
-        let fifo_fill = self
-            .fifos
-            .iter()
-            .filter_map(|(id, fifo)| fifo.fill().ok().map(|n| (id.clone(), n)))
-            .collect();
+        for pid in liveness::take_exited(&mut self.polled) {
+            let actions = self.broker.pid_exited(pid, Instant::now());
+            self.apply(actions);
+        }
+        let fifo_fill = self.read_fills();
         let input = TickInput {
             now: Instant::now(),
             memory,
@@ -206,6 +213,30 @@ impl Engine {
         };
         let actions = self.broker.tick(&input);
         self.apply(actions);
+    }
+
+    /// Each FIFO's fill. A FIFO that can't be read is left out of this tick;
+    /// the first failure of a run of them is logged.
+    fn read_fills(&mut self) -> HashMap<SessionId, u32> {
+        let mut fills = HashMap::new();
+        let mut newly_failing = Vec::new();
+        for (id, fifo) in &self.fifos {
+            match fifo.fill() {
+                Ok(n) => {
+                    self.fill_failing.remove(id);
+                    fills.insert(id.clone(), n);
+                }
+                Err(e) => {
+                    if self.fill_failing.insert(id.clone()) {
+                        newly_failing.push(format!("reading the fill of session {id}'s FIFO: {e}"));
+                    }
+                }
+            }
+        }
+        for message in newly_failing {
+            self.error(message);
+        }
+        fills
     }
 
     fn handle(&mut self, request: Request) {
@@ -264,6 +295,7 @@ impl Engine {
             }
             Action::RemoveFifo { session } => {
                 self.clients.remove(&session);
+                self.fill_failing.remove(&session);
                 if let Some(fifo) = self.fifos.remove(&session) {
                     match fifo.remove() {
                         Err(e) if e.kind() != io::ErrorKind::NotFound => {
@@ -280,7 +312,10 @@ impl Engine {
             }
             Action::WatchPid { pid } => {
                 if let Err(e) = self.watcher.watch(pid) {
-                    self.error(format!("watching pid {pid}: {e}"));
+                    self.error(format!(
+                        "watching pid {pid}: {e}; checking it every tick instead"
+                    ));
+                    self.polled.insert(pid);
                 }
                 Vec::new()
             }

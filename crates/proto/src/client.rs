@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::event::{Event, EventKind};
-use crate::framing::{MAX_LINE, ProtoError, decode, encode};
+use crate::framing::{MAX_LINE, ProtoError, decode_with_limit, encode};
 use crate::msg::{ClientMsg, ServerMsg, SessionId};
 
 /// The shortest read/write timeout the OS accepts; zero would mean "block".
@@ -82,9 +82,22 @@ impl Client {
     /// a newline (poisons the connection), [`ProtoError::Io`] (poisons it),
     /// plus decoding errors.
     pub fn recv(&mut self, timeout: Option<Duration>) -> Result<ServerMsg, ProtoError> {
+        self.recv_with_limit(timeout, MAX_LINE)
+    }
+
+    /// Like [`Client::recv`], accepting a line of up to `max` bytes: the CLI
+    /// reads `Status` and `Events` replies with [`crate::MAX_REPLY`].
+    ///
+    /// # Errors
+    /// As [`Client::recv`], with `max` in place of [`MAX_LINE`].
+    pub fn recv_with_limit(
+        &mut self,
+        timeout: Option<Duration>,
+        max: usize,
+    ) -> Result<ServerMsg, ProtoError> {
         self.check_usable()?;
         let deadline = timeout.and_then(|d| Instant::now().checked_add(d));
-        let result = self.read_line(deadline);
+        let result = self.read_line(deadline, max);
         if let Err(ProtoError::LineTooLong | ProtoError::Io(_)) = result {
             self.pending.clear();
             self.poisoned = true;
@@ -92,7 +105,11 @@ impl Client {
         result
     }
 
-    fn read_line(&mut self, deadline: Option<Instant>) -> Result<ServerMsg, ProtoError> {
+    fn read_line(
+        &mut self,
+        deadline: Option<Instant>,
+        max: usize,
+    ) -> Result<ServerMsg, ProtoError> {
         loop {
             let remaining = match deadline {
                 Some(end) => {
@@ -110,12 +127,12 @@ impl Client {
                 // read with a stale timeout: drain what is already there
                 // without blocking instead.
                 Err(err) if err.kind() == ErrorKind::InvalidInput => {
-                    return self.read_line_nonblocking(err);
+                    return self.read_line_nonblocking(err, max);
                 }
                 Err(err) => return Err(err.into()),
             }
-            if let Some(line) = self.read_chunk()? {
-                return decode(&line);
+            if let Some(line) = self.read_chunk(max)? {
+                return decode_with_limit(&line, max);
             }
         }
     }
@@ -124,11 +141,15 @@ impl Client {
     /// changed. A closed peer yields its remaining data, then EOF. If the
     /// read would block, the peer is still open and the timeout error
     /// `cause` is the real failure.
-    fn read_line_nonblocking(&mut self, cause: std::io::Error) -> Result<ServerMsg, ProtoError> {
+    fn read_line_nonblocking(
+        &mut self,
+        cause: std::io::Error,
+        max: usize,
+    ) -> Result<ServerMsg, ProtoError> {
         self.reader.get_ref().set_nonblocking(true)?;
         let result = loop {
-            match self.read_chunk() {
-                Ok(Some(line)) => break decode(&line),
+            match self.read_chunk(max) {
+                Ok(Some(line)) => break decode_with_limit(&line, max),
                 Ok(None) => {}
                 Err(ProtoError::Timeout) => break Err(ProtoError::Io(cause)),
                 Err(err) => break Err(err),
@@ -140,9 +161,9 @@ impl Client {
 
     /// One bounded read of at most one `fill_buf`, so the caller can check
     /// its deadline between reads. Returns a complete line, or `None` if
-    /// more is needed.
-    fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, ProtoError> {
-        let room = (MAX_LINE + 1).saturating_sub(self.pending.len());
+    /// more is needed. Never buffers more than `max + 1` bytes.
+    fn read_chunk(&mut self, max: usize) -> Result<Option<Vec<u8>>, ProtoError> {
+        let room = max.saturating_add(1).saturating_sub(self.pending.len());
         let available = self.reader.fill_buf().map_err(map_io)?;
         if available.is_empty() {
             return Err(ProtoError::Closed);
@@ -157,7 +178,7 @@ impl Client {
         if complete {
             return Ok(Some(std::mem::take(&mut self.pending)));
         }
-        if self.pending.len() > MAX_LINE {
+        if self.pending.len() > max {
             return Err(ProtoError::LineTooLong);
         }
         Ok(None)

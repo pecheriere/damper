@@ -15,6 +15,9 @@ mod tests;
 
 pub use client::{Client, explain_events};
 pub use event::{Event, EventKind, InputsSummary, LimitReason, Pressure};
-pub use framing::{Envelope, MAX_LINE, PROTOCOL_VERSION, ProtoError, decode, encode};
+pub use framing::{
+    Envelope, MAX_LINE, MAX_REPLY, PROTOCOL_VERSION, ProtoError, decode, decode_with_limit, encode,
+    encode_with_limit,
+};
 pub use msg::{ClientMsg, HoldReason, ServerMsg, SessionId};
 pub use status::{SessionState, SessionStatus, Status};

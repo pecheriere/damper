@@ -82,8 +82,12 @@ pub enum ServerMsg {
     Status(Status),
     /// A struct variant rather than a newtype around the list: serde cannot
     /// serialise a sequence inside an internally tagged newtype variant.
+    ///
+    /// `truncated` is set when the oldest events were left out so that the
+    /// reply fits in [`crate::MAX_REPLY`].
     Events {
         events: Vec<Event>,
+        truncated: bool,
     },
     Error {
         message: String,

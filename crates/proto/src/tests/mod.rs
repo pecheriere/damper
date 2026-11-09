@@ -1,6 +1,7 @@
 #![expect(clippy::unwrap_used, reason = "test")]
 
 mod fixtures;
+mod limits;
 
 use std::io::Write;
 use std::os::unix::net::UnixListener;
@@ -43,6 +44,7 @@ fn snapshot_wire_format() {
     );
     let events = ServerMsg::Events {
         events: vec![limit_changed(5)],
+        truncated: false,
     };
     insta::assert_snapshot!(
         "events",
