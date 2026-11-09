@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -145,15 +145,23 @@ fn a_kqueue_failure_is_not_an_exit() {
 
 #[test]
 fn signals_still_reach_cargo_until_reaped_when_the_wait_failed() {
-    let child = Command::new("/bin/sleep").arg("0.5").spawn().unwrap();
+    // `cat` runs until the test closes its stdin, so nothing races the check.
+    let mut child = Command::new("/bin/cat")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let release = child.stdin.take().unwrap();
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
     let phase: SharedPhase = Arc::new(Mutex::new(Phase::Running(pid)));
     let reaper = {
         let phase = Arc::clone(&phase);
         thread::spawn(move || reap(child, &phase, false))
     };
-    thread::sleep(Duration::from_millis(200));
+    // Give the reaper time to block in its wait; the child cannot exit yet.
+    thread::sleep(Duration::from_millis(100));
+    assert!(!reaper.is_finished());
     assert!(matches!(*lock(&phase), Phase::Running(p) if p == pid));
+    drop(release);
     assert!(reaper.join().unwrap().unwrap().success());
     assert!(matches!(*lock(&phase), Phase::Done));
 }
