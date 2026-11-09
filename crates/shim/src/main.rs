@@ -5,10 +5,14 @@
 //! build's outcome.
 
 mod decide;
+mod fallback;
+mod hold;
 mod launch;
 mod resolve;
+mod session;
+mod supervise;
 
-use damper_core::classify::{ThreadEnv, classify};
+use damper_core::classify::{Invocation, ThreadEnv, classify};
 use damper_core::config::{Effective, Machine, Priority, load};
 use damper_proto::paths::{Paths, resolve_paths, resolve_paths_from};
 use decide::{Route, ShimEnv, route};
@@ -35,21 +39,51 @@ fn main() -> ExitCode {
     else {
         return fail(NO_CARGO, 127);
     };
-    let wrapped = guarded(
-        || {
-            let priority = decide_priority(&args);
+    let plan = catch_unwind(|| plan(&args)).unwrap_or(Plan::Exec(Priority::None));
+    let (cargo_path, cargo_args) = (cargo.as_path(), args.as_slice());
+    let with_priority = |priority| {
+        move || {
             launch::command_for(
-                &cargo,
-                &args,
+                cargo_path,
+                cargo_args,
                 priority,
                 Path::new(launch::TASKPOLICY),
                 Path::new(launch::NICE),
             )
-        },
-        &cargo,
-        &args,
-    );
-    exec_or_fall_back(wrapped, &cargo, &args)
+        }
+    };
+    let command = match plan {
+        Plan::Exec(priority) => guarded(with_priority(priority), &cargo, &args),
+        Plan::Session {
+            paths,
+            inv,
+            priority,
+        } => {
+            let session = catch_unwind(AssertUnwindSafe(|| {
+                supervise::run(&paths, &inv, with_priority(priority))
+            }));
+            match session {
+                Ok(supervise::Outcome::Exit(code)) => return code,
+                Ok(supervise::Outcome::Exec(command)) => command,
+                // A panic before cargo starts: run it plainly. Once cargo
+                // has started, `supervise::run` catches its own panics.
+                Err(_) => direct_command(&cargo, &args),
+            }
+        }
+    };
+    exec_or_fall_back(command, &cargo, &args)
+}
+
+/// How this invocation runs.
+enum Plan {
+    /// Exec the real cargo at this priority.
+    Exec(Priority),
+    /// Open a session; on any failure, exec at `priority`.
+    Session {
+        paths: Paths,
+        inv: Invocation,
+        priority: Priority,
+    },
 }
 
 /// Runs `build`; if it panics, the command is cargo itself with no wrapper.
@@ -90,9 +124,8 @@ fn fail(message: &str, code: u8) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// Works out the priority to run cargo at. Task 12 opens sessions in the
-/// `Route::Session` branch; until then a session route also just execs.
-fn decide_priority(args: &[OsString]) -> Priority {
+/// Works out how to run cargo: plainly at a priority, or in a session.
+fn plan(args: &[OsString]) -> Plan {
     let paths = resolve_paths();
     // A bad state dir must not turn off the user's priority, so the config
     // path falls back to the default location.
@@ -109,9 +142,15 @@ fn decide_priority(args: &[OsString]) -> Priority {
     let inv = classify(args, &cfg.extra_build_subcommands, threads);
     let env = shim_env(paths.as_ref().ok());
     let disabled = paths.as_ref().is_ok_and(|p| p.disabled.exists());
-    match route(env, inv, &cfg, disabled) {
-        Route::Exec { priority } => priority,
-        Route::Session(_) => cfg.priority,
+    match (route(env, inv, &cfg, disabled), paths) {
+        (Route::Exec { priority }, _) => Plan::Exec(priority),
+        (Route::Session(inv), Ok(paths)) => Plan::Session {
+            paths,
+            inv,
+            priority: cfg.priority,
+        },
+        // No usable state dir means no daemon to talk to.
+        (Route::Session(_), Err(_)) => Plan::Exec(cfg.priority),
     }
 }
 
