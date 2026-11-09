@@ -112,7 +112,7 @@ fn hung_damperd_takes_back_the_self_fed_tokens() {
     signal(daemon, Signal::SIGCONT);
     wait_until("the daemon to count the self-feed", || {
         run.env.events().into_iter().find(|e| {
-            matches!(&e.kind, EventKind::ShimFallback { reason, .. } if reason.contains("counted as given"))
+            matches!(&e.kind, EventKind::ShimFallback { reason, .. } if reason.contains("now counts them as given"))
         })
     });
     // With `cores = 2` the session's share is one token: the rest go back.

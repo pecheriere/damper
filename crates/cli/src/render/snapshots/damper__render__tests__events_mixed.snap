@@ -10,7 +10,7 @@ expression: "render_events(&mixed(), NOW, false)"
   1m ago  session 6543-2 released after 30s
   1m ago  session 6543-3 released after 10m00s (waited the maximum and ran anyway)
  30s ago  session 6543-1 closed after 59m30s, recovered 2 tokens
- 20s ago  shim ran cargo without damper in /work/demo: daemon not running
+ 20s ago  shim fell back in /work/demo: daemon not running
  15s ago  config loaded with 1 warning(s): unknown key `foo` ignored
  10s ago  client rejected: unsupported protocol version 9
   5s ago  error: sampling failed

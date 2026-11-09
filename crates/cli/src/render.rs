@@ -212,11 +212,9 @@ fn describe(kind: &EventKind) -> String {
             clean(&session.0),
             fmt_secs(duration_ms / 1000),
         ),
-        EventKind::ShimFallback { reason, cwd } => format!(
-            "shim ran cargo without damper in {}: {}",
-            clean_path(cwd),
-            clean(reason),
-        ),
+        EventKind::ShimFallback { reason, cwd } => {
+            format!("shim fell back in {}: {}", clean_path(cwd), clean(reason))
+        }
         EventKind::ConfigLoaded { warnings } if warnings.is_empty() => "config loaded".to_owned(),
         EventKind::ConfigLoaded { warnings } => format!(
             "config loaded with {} warning(s): {}",

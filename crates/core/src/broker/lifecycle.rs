@@ -132,7 +132,7 @@ impl Broker {
         s.given = s.given.saturating_add(tokens.saturating_sub(adopted));
         vec![Action::Log(EventKind::ShimFallback {
             reason: format!(
-                "session {session}: the shim fed {tokens} tokens itself after losing the daemon; counted as given"
+                "session {session} fed {tokens} tokens itself while the daemon was away; the daemon now counts them as given"
             ),
             cwd: s.req.cwd.clone(),
         })]
