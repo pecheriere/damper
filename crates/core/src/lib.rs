@@ -1,5 +1,7 @@
 //! Memory-pressure policy and accounting for damper.
 
+pub mod account;
+pub mod allocate;
 pub mod classify;
 pub mod config;
 pub mod peak;
