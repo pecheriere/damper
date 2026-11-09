@@ -1,0 +1,5 @@
+---
+source: crates/proto/src/tests/mod.rs
+expression: "String::from_utf8(encode(&open).unwrap()).unwrap()"
+---
+{"v":1,"type":"open","cwd":"/work/demo","subcommand":"build","shim_pid":100,"parent_pid":99,"nested":false}
