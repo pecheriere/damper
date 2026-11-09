@@ -31,6 +31,7 @@ Nothing refutes the design. Five changes follow, listed at the end.
   | 3 | 4 | 16.1 s |
 
   The maximum is always N+1. The extra one is cargo's implicit slot, as design §5.1 expects.
+
 - **Growth works live.** Starting from 1 token and adding 6 more after 5 s, concurrency per second went 2, 2, 2, 2, 7, 8, 8 … 8, then tailed off. Cargo picks up new tokens within a second.
 - **Tokens all come back.** After each build the FIFO held exactly the tokens seeded plus added (3 after N=3, 7 after the growth run).
 - **Variables.** Cargo honours `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` alike (N=1 gives a maximum of 2 with each).
@@ -47,10 +48,12 @@ Nothing refutes the design. Five changes follow, listed at the end.
   | no jobserver | 24 | 0 |
 
   The source confirms it. `src/compiler/rust.rs:1867` in sccache 0.19.0 skips `CARGO_MAKEFLAGS` when hashing the `CARGO_*` env vars, with the comment "CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable".
+
 - **The nuance.** The sccache server creates its own jobserver, sized to `num_cpus` (10 here), in `src/jobserver.rs:48` and `commands.rs:959`. When it spawns rustc, it removes `MAKEFLAGS`, `MFLAGS` and `CARGO_MAKEFLAGS` and hands rustc its own pool instead (`src/mock_command.rs:266-268`, `share_jobserver: true` at `rust.rs:2095`). So:
   - damper's session tokens limit how many rustc *processes* run, because cargo holds a token for each job while the sccache client waits. That's the part that matters for memory.
   - rustc's *internal* thread parallelism draws on sccache's machine-wide pool of 10, not damper's.
   - That's compatible. sccache's pool is itself machine-wide, so it already stops thread oversubscription.
+
 - **Note.** sccache never caches incremental compiles. In the dev profile, workspace members are incremental, so on real projects sccache caches dependencies only. That's sccache behaviour, unrelated to damper. The test needed `incremental = false` to exercise cache keys at all.
 
 ## S3: `FIONREAD` on a macOS FIFO
@@ -65,6 +68,7 @@ Nothing refutes the design. Five changes follow, listed at the end.
   - `kern.memorystatus_level` (57, the percentage of memory available);
   - `vm.swapusage` (2.4 GB of 4 GB used at rest);
   - `vm_stat` compressor pages.
+
 - **The event source registers.** `DispatchSource.makeMemoryPressureSource` registers fine from a plain Swift binary.
 - **Not verified: events firing.** `memory_pressure -S` (simulation) needs root, failing with `kern.memorypressure_manual_trigger: Operation not permitted`. I didn't escalate. Real events should occur during the Phase 1 acceptance test (§11), which drives the Mac into pressure. The sysctl level is the fallback, polled every second.
 - **`proc_pid_rusage` works on the user's own processes** (`ri_phys_footprint`). Peak footprint per rustc:
