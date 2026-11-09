@@ -124,6 +124,11 @@ impl Env {
         wait_until("damperd to answer", || self.try_status());
     }
 
+    /// The running daemon's pid.
+    pub fn daemon_pid(&self) -> u32 {
+        self.daemon.as_ref().expect("no daemon is running").0.id()
+    }
+
     /// Sends `sig` to the daemon and waits for it to exit.
     pub fn stop_daemon(&mut self, sig: Signal) {
         let mut daemon = self.daemon.take().unwrap();

@@ -57,7 +57,7 @@ impl DaemonLoss {
     /// one token, plus what the shim fed: one per core beyond the first.
     /// Two or more tokens can only come from the shim (on a machine with at
     /// least three cores), and more than two jobs at once can only run on them.
-    fn finish_on_self_feed(mut self) {
+    fn finish_on_self_feed(&mut self) {
         wait_until("the shim to feed the FIFO", || {
             (self.fifo.tokens() >= 2).then_some(())
         });
@@ -69,6 +69,22 @@ impl DaemonLoss {
         // The shim unlinks a FIFO it fed itself once cargo is done.
         assert!(!self.fifo.path.exists(), "the FIFO outlived its build");
     }
+
+    /// Waits until `damper log` shows the shim's record of feeding the FIFO
+    /// itself (spec §7.1, §11).
+    fn wait_self_feed_logged(&self) {
+        wait_until("the self-feed in the log", || {
+            self.env
+                .events()
+                .into_iter()
+                .find(|e| is_shim_self_feed(&e.kind))
+        });
+    }
+}
+
+/// The shim's own record of a mid-build self-feed.
+fn is_shim_self_feed(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::ShimFallback { reason, .. } if reason.contains("mid-build"))
 }
 
 #[test]
@@ -76,6 +92,37 @@ fn kill_damperd_mid_build() {
     let mut run = DaemonLoss::start();
     run.env.stop_daemon(Signal::SIGKILL);
     run.finish_on_self_feed();
+    // The next daemon moves the shim's record into the log.
+    run.env.start_daemon();
+    run.wait_self_feed_logged();
+}
+
+/// A daemon that hangs rather than dies (ruling R22): the shim feeds the FIFO
+/// after the heartbeat timeout and says so. Once the daemon recovers it
+/// counts those tokens as given and drains them back, and the shim's record
+/// reaches the log while the daemon runs.
+#[test]
+fn hung_damperd_takes_back_the_self_fed_tokens() {
+    let mut run = DaemonLoss::start();
+    let daemon = run.env.daemon_pid();
+    signal(daemon, Signal::SIGSTOP);
+    wait_until("the shim to feed the FIFO", || {
+        (run.fifo.tokens() >= 2).then_some(())
+    });
+    signal(daemon, Signal::SIGCONT);
+    wait_until("the daemon to count the self-feed", || {
+        run.env.events().into_iter().find(|e| {
+            matches!(&e.kind, EventKind::ShimFallback { reason, .. } if reason.contains("counted as given"))
+        })
+    });
+    // With `cores = 2` the session's share is one token: the rest go back.
+    wait_until("the daemon to drain the self-fed tokens", || {
+        (run.fifo.tokens() <= 1).then_some(())
+    });
+    run.wait_self_feed_logged();
+    std::fs::write(&run.barrier, b"").unwrap();
+    assert_eq!(run.build.wait().code(), Some(0));
+    assert_eq!(run.build.stderr(), "");
 }
 
 #[test]
@@ -156,6 +203,7 @@ fn damperd_restart_keeps_running_build() {
     assert!(run.build.running(), "the build ended before the check");
     assert!(run.fifo.path.exists(), "the new daemon deleted a live FIFO");
     run.finish_on_self_feed();
+    run.wait_self_feed_logged();
 }
 
 #[test]

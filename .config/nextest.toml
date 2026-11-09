@@ -5,3 +5,10 @@
 # test from flickering SLOW.
 [profile.default]
 slow-timeout = { period = "20s", terminate-after = 3 }
+
+# A hung daemon is noticed only after the shim's 10 s heartbeat timeout, and
+# the shim's record reaches the log on the daemon's next 5 s ingest: the test
+# took 26 s when measured on 2026-11-09. Killed after 80 s, about three times that.
+[[profile.default.overrides]]
+filter = "test(hung_damperd_takes_back_the_self_fed_tokens)"
+slow-timeout = { period = "40s", terminate-after = 2 }
