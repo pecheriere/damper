@@ -71,8 +71,18 @@ class BuildPlanTests(unittest.TestCase):
         self.assertIn("/ssd/run-abc/target-1", cmd)
         self.assertIn('build.build-dir="/ssd/run-abc/build-1"', cmd)
         self.assertIn('build.rustc-wrapper="sccache"', cmd)
-        self.assertIn('env.SCCACHE_DIR={value="/ssd/run-abc/sccache", force=true}', cmd)
-        self.assertIn('env.SCCACHE_SERVER_PORT={value="4242", force=true}', cmd)
+        self.assertIn('env.SCCACHE_DIR.value="/ssd/run-abc/sccache"', cmd)
+        self.assertIn("env.SCCACHE_DIR.force=true", cmd)
+        self.assertIn('env.SCCACHE_SERVER_PORT.value="4242"', cmd)
+        self.assertIn("env.SCCACHE_SERVER_PORT.force=true", cmd)
+
+    def test_no_inline_tables_in_config_flags(self) -> None:
+        """Cargo rejects a --config value that is an inline table."""
+        cmd = run.build_command(make_plan(), 0)
+        values = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--config"]
+        self.assertTrue(values)
+        for value in values:
+            self.assertNotIn("={", value)
 
     def test_off_command_clears_wrapper(self) -> None:
         """No wrapper and no sccache env."""

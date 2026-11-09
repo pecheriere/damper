@@ -217,10 +217,16 @@ def sccache_args(plan: Plan) -> list[str]:
     return [
         "--config",
         'build.rustc-wrapper="sccache"',
+        # Cargo refuses inline tables in --config, so each [env] entry is
+        # set through dotted keys: value and force as separate flags.
         "--config",
-        f"env.SCCACHE_DIR={{value={json.dumps(str(plan.sccache_dir))}, force=true}}",
+        f"env.SCCACHE_DIR.value={json.dumps(str(plan.sccache_dir))}",
         "--config",
-        f'env.SCCACHE_SERVER_PORT={{value="{plan.port or "<free port>"}", force=true}}',
+        "env.SCCACHE_DIR.force=true",
+        "--config",
+        f'env.SCCACHE_SERVER_PORT.value="{plan.port or "<free port>"}"',
+        "--config",
+        "env.SCCACHE_SERVER_PORT.force=true",
     ]
 
 
