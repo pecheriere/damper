@@ -16,10 +16,41 @@ use damper_proto::{
 const TRUNCATED_NOTICE: &str =
     "note: older events were omitted (reply too large); narrow the range with --since.\n";
 
-/// Replaces control characters, which could carry terminal escapes.
-fn clean(text: &str) -> String {
+/// Unicode format (Cf) and line/paragraph separator characters that can
+/// reorder or hide text on a terminal. Control characters are caught by
+/// [`char::is_control`]; this list covers the rest.
+const INVISIBLE: &[(char, char)] = &[
+    ('\u{00ad}', '\u{00ad}'),
+    ('\u{0600}', '\u{0605}'),
+    ('\u{061c}', '\u{061c}'),
+    ('\u{06dd}', '\u{06dd}'),
+    ('\u{070f}', '\u{070f}'),
+    ('\u{0890}', '\u{0891}'),
+    ('\u{08e2}', '\u{08e2}'),
+    ('\u{180e}', '\u{180e}'),
+    ('\u{200b}', '\u{200f}'),
+    ('\u{2028}', '\u{202e}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206f}'),
+    ('\u{feff}', '\u{feff}'),
+    ('\u{fff9}', '\u{fffb}'),
+    ('\u{110bd}', '\u{110bd}'),
+    ('\u{110cd}', '\u{110cd}'),
+    ('\u{13430}', '\u{1343f}'),
+    ('\u{1bca0}', '\u{1bca3}'),
+    ('\u{1d173}', '\u{1d17a}'),
+    ('\u{e0001}', '\u{e0001}'),
+    ('\u{e0020}', '\u{e007f}'),
+];
+
+/// Replaces control and invisible format characters, which could carry
+/// terminal escapes or reorder text. Every print site of outside text uses it.
+pub(crate) fn clean(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            let invisible = INVISIBLE.iter().any(|&(lo, hi)| (lo..=hi).contains(&c));
+            if c.is_control() || invisible { '?' } else { c }
+        })
         .collect()
 }
 

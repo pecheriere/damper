@@ -237,3 +237,20 @@ fn explain_unknown_session() {
         "No events for session nope.\n"
     );
 }
+
+#[test]
+fn clean_replaces_control_and_format_characters() {
+    for c in [
+        '\u{1b}',
+        '\u{7}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{200b}',
+        '\u{feff}',
+        '\u{e0041}',
+        '\u{2028}',
+    ] {
+        assert_eq!(super::clean(&format!("a{c}b")), "a?b", "{c:?}");
+    }
+    assert_eq!(super::clean("plain é 日本"), "plain é 日本");
+}

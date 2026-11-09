@@ -14,7 +14,7 @@ workspace = true
 damper-core = { version = "0.1.0", path = "../core" }
 damper-proto = { version = "0.1.0", path = "../proto" }
 clap = { version = "4.6.7", features = ["derive"] }
-nix = { version = "0.31.3", features = ["user"] }
+nix = { version = "0.31.3", features = ["user", "fs"] }
 serde_json = "1.0.154"
 sysctl = "0.7.1"
 

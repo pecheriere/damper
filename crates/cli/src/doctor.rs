@@ -174,13 +174,13 @@ fn config(paths: &Paths) -> Check {
 fn disabled_flag(paths: &Paths) -> Check {
     let detail = if paths.disabled.exists() {
         format!(
-            "set ({}): damper is off; run 'damper enable'",
+            "disabled: flag set ({}); damper is off, run 'damper enable'",
             paths.disabled.display()
         )
     } else {
-        "not set".to_owned()
+        "not disabled (flag not set)".to_owned()
     };
-    check("disabled flag", true, detail)
+    check("disabled flag (damper off when set)", true, detail)
 }
 
 #[cfg(test)]

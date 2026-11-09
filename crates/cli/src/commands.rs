@@ -4,15 +4,16 @@
 use std::fmt::Display;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use damper_core::config::{Priority, load};
-use damper_proto::paths::{Paths, prepare_dirs, resolve_paths};
+use damper_proto::paths::{PathError, Paths, prepare_dirs, resolve_paths};
 use damper_proto::{Client, ClientMsg, Event, MAX_REPLY, ProtoError, ServerMsg, SessionId, Status};
+use nix::fcntl::OFlag;
 
-use crate::render::{fmt_bytes, fmt_secs, render_events, render_explain, render_status};
+use crate::render::{clean, fmt_bytes, fmt_secs, render_events, render_explain, render_status};
 use crate::{Command, ConfigAction, doctor, machine};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,14 +40,14 @@ pub fn run(command: &Command, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
         Ok(()) => 0,
         Err(Failure::Reported) => 1,
         Err(Failure::Message(message)) => {
-            let _ = writeln!(err, "damper: {message}");
+            let _ = writeln!(err, "damper: {}", clean(&message));
             1
         }
         Err(Failure::NotRunning(socket)) => {
             let _ = writeln!(
                 err,
                 "damper: damperd is not running (socket {}). Start it with 'brew services start damper'.",
-                socket.display()
+                clean(&socket.to_string_lossy())
             );
             2
         }
@@ -62,10 +63,7 @@ fn dispatch(command: &Command, out: &mut dyn Write) -> Result<(), Failure> {
             since,
             session,
         } => {
-            let since_ms = since
-                .map(|d| u64::try_from(d.as_millis()))
-                .transpose()
-                .map_err(|_| Failure::Message("--since is too large".to_owned()))?;
+            let since_ms = since.map(|d| since_cutoff(now_ms(), d));
             let session = session.clone().map(SessionId);
             events(
                 &paths,
@@ -101,19 +99,64 @@ fn dispatch(command: &Command, out: &mut dyn Write) -> Result<(), Failure> {
             Ok(())
         }
         Command::Disable => {
-            prepare_dirs(&paths)?;
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&paths.disabled)?;
+            prepare_dirs(&paths).map_err(|e| match e {
+                PathError::BadMode { path, .. } => Failure::Message(format!(
+                    "{} is accessible by group or others; run: chmod 700 {}",
+                    path.display(),
+                    path.display()
+                )),
+                other => other.into(),
+            })?;
+            set_disabled_flag(&paths.disabled)?;
             writeln!(
                 out,
                 "damper is disabled; run 'damper enable' to turn it back on"
             )?;
             Ok(())
         }
+    }
+}
+
+/// The absolute time (epoch ms) `since` before `now_ms`; zero when `since`
+/// reaches back past the epoch.
+fn since_cutoff(now_ms: u64, since: Duration) -> u64 {
+    let since_ms = u64::try_from(since.as_millis()).unwrap_or(u64::MAX);
+    now_ms.saturating_sub(since_ms)
+}
+
+/// Creates the disabled flag without following a symlink or truncating
+/// anything. An existing regular file already means "disabled"; anything else
+/// at that path is refused.
+fn set_disabled_flag(flag: &std::path::Path) -> Result<(), Failure> {
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(flag);
+    match created {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let kind = fs::symlink_metadata(flag)?.file_type();
+            if kind.is_file() {
+                Ok(())
+            } else {
+                let what = if kind.is_symlink() {
+                    "a symlink"
+                } else if kind.is_dir() {
+                    "a directory"
+                } else if kind.is_socket() {
+                    "a socket"
+                } else {
+                    "not a regular file"
+                };
+                Err(Failure::Message(format!(
+                    "{} is {what}; remove it and run 'damper disable' again",
+                    flag.display()
+                )))
+            }
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -215,9 +258,12 @@ fn config_check(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
         out,
         "config file: {}",
         if text.is_some() {
-            paths.config.display().to_string()
+            clean(&paths.config.to_string_lossy())
         } else {
-            format!("none at {} (defaults)", paths.config.display())
+            format!(
+                "none at {} (defaults)",
+                clean(&paths.config.to_string_lossy())
+            )
         }
     )?;
     writeln!(out, "cores: {}", e.cores)?;
@@ -231,7 +277,7 @@ fn config_check(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
         if e.extra_build_subcommands.is_empty() {
             "none".to_owned()
         } else {
-            e.extra_build_subcommands.join(", ")
+            clean(&e.extra_build_subcommands.join(", "))
         }
     )?;
     if loaded.warnings.is_empty() {
@@ -239,7 +285,7 @@ fn config_check(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
     }
     writeln!(out, "warnings:")?;
     for warning in &loaded.warnings {
-        writeln!(out, "  - {warning}")?;
+        writeln!(out, "  - {}", clean(warning))?;
     }
     Err(Failure::Reported)
 }
@@ -253,7 +299,7 @@ fn run_doctor(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
             "{} {}: {}",
             if c.ok { "ok  " } else { "FAIL" },
             c.name,
-            c.detail
+            clean(&c.detail)
         )?;
     }
     if checks.iter().all(|c| c.ok) {
@@ -262,3 +308,6 @@ fn run_doctor(paths: &Paths, out: &mut dyn Write) -> Result<(), Failure> {
         Err(Failure::Reported)
     }
 }
+
+#[cfg(test)]
+mod tests;
