@@ -6,20 +6,21 @@ use std::time::Instant;
 use damper_proto::{EventKind, ServerMsg, SessionId};
 
 use super::session::{Cargo, Session, State};
-use super::{Action, Broker, MAX_SESSIONS, OpenError, OpenRequest, millis};
+use super::{Action, Broker, OpenError, OpenRequest, millis};
 
 impl Broker {
     /// Registers a session and asks the daemon to create its FIFO.
     ///
     /// # Errors
     ///
-    /// [`OpenError::TooManySessions`] when [`MAX_SESSIONS`] are open.
+    /// [`OpenError::TooManySessions`] when the cap ([`super::MAX_SESSIONS`] by
+    /// default) is reached.
     pub fn open(
         &mut self,
         now: Instant,
         req: OpenRequest,
     ) -> Result<(SessionId, Vec<Action>), OpenError> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.sessions.len() >= self.max_sessions {
             return Err(OpenError::TooManySessions);
         }
         let id = SessionId(format!("{:x}-{}", self.start_unix_secs, self.next_id));

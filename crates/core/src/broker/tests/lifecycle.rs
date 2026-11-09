@@ -118,3 +118,12 @@ fn reconfigure_before_the_first_tick_replaces_the_startup_config() {
     assert_eq!(status.reason, LimitReason::Startup);
     assert_eq!(status.warnings, vec!["x".to_owned()]);
 }
+
+#[test]
+fn a_lowered_cap_refuses_the_next_open() {
+    let t0 = Instant::now();
+    let mut b = broker(4, t0).with_max_sessions(2);
+    b.open(t0, req(1)).unwrap();
+    b.open(t0, req(2)).unwrap();
+    assert_eq!(b.open(t0, req(3)), Err(OpenError::TooManySessions));
+}

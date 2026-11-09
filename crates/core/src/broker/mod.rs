@@ -136,8 +136,8 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum OpenError {
-    /// [`MAX_SESSIONS`] are already open.
-    #[error("too many open sessions (at most {MAX_SESSIONS})")]
+    /// The session cap ([`MAX_SESSIONS`] unless lowered) is reached.
+    #[error("too many open sessions")]
     TooManySessions,
 }
 
@@ -160,6 +160,8 @@ pub struct Broker {
     inputs: InputsSummary,
     /// Start-up events, logged by the first tick.
     startup: Vec<Action>,
+    /// The most sessions open at once.
+    max_sessions: usize,
 }
 
 impl Broker {
@@ -189,7 +191,16 @@ impl Broker {
                 reserve: 0,
             },
             startup,
+            max_sessions: MAX_SESSIONS,
         }
+    }
+
+    /// The same broker with a different session cap, so the cap can be
+    /// tested without opening [`MAX_SESSIONS`] sessions.
+    #[must_use]
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
     }
 
     /// Applies a new configuration: logs `ConfigLoaded`, and `LimitChanged`
