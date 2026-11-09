@@ -123,6 +123,10 @@ fn hung_damperd_takes_back_the_self_fed_tokens() {
     std::fs::write(&run.barrier, b"").unwrap();
     assert_eq!(run.build.wait().code(), Some(0));
     assert_eq!(run.build.stderr(), "");
+    // The share's token stayed: counting the self-feed twice would have
+    // drained it too and left cargo only its implicit slot.
+    let peak = Report::read(&run.report).peak;
+    assert!(peak >= 2, "only {peak} job at once after the recovery");
 }
 
 #[test]
