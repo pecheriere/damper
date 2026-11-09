@@ -275,7 +275,8 @@ impl Engine {
                 self.apply(actions);
             }
             Request::SelfFed { session, tokens } => {
-                // The shim feeds at most the machine's cores (less one).
+                // The shim feeds the machine's cores less one; capping a claim
+                // at the core count bounds it without undercounting real tokens.
                 let max = self.config.machine.cores;
                 let actions = self.broker.self_fed(&session, tokens, max);
                 self.apply(actions);
