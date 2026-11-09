@@ -217,16 +217,15 @@ def sccache_args(plan: Plan) -> list[str]:
     return [
         "--config",
         'build.rustc-wrapper="sccache"',
-        # Cargo refuses inline tables in --config, so each [env] entry is
-        # set through dotted keys: value and force as separate flags.
+        # Plain strings: a --config value takes precedence over the same key in
+        # ~/.cargo/config.toml's [env], where these are plain strings. Cargo
+        # refuses inline tables here and can't merge a table onto a string key,
+        # so `{ value, force }` fails either way. If a config file uses the
+        # table form, the merge fails loudly instead of building warm.
         "--config",
-        f"env.SCCACHE_DIR.value={json.dumps(str(plan.sccache_dir))}",
+        f"env.SCCACHE_DIR={json.dumps(str(plan.sccache_dir))}",
         "--config",
-        "env.SCCACHE_DIR.force=true",
-        "--config",
-        f'env.SCCACHE_SERVER_PORT.value="{plan.port or "<free port>"}"',
-        "--config",
-        "env.SCCACHE_SERVER_PORT.force=true",
+        f'env.SCCACHE_SERVER_PORT="{plan.port or "<free port>"}"',
     ]
 
 

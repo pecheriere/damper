@@ -40,9 +40,11 @@ Builds are cold. Per build the script passes `--config` flags (never `CARGO_*`
 variables): a fresh `build.build-dir` inside the run directory, and the sccache
 mode. `--sccache cold` starts a dedicated sccache server with a fresh cache and
 port for the run (so rustc still runs under sccache, as in real use) and stops
-it afterwards; the cache dir and port are also forced with `env.SCCACHE_DIR` and
-`env.SCCACHE_SERVER_PORT` so the `[env]` table in `~/.cargo/config.toml` cannot
-override them. `--sccache off` clears the rustc wrapper. Baseline and damper runs
+it afterwards; the cache dir and port are also passed as plain-string
+`--config env.SCCACHE_DIR` and `env.SCCACHE_SERVER_PORT`, which take precedence
+over the same keys in the `[env]` table of `~/.cargo/config.toml`. If that file
+uses the `{ value, force }` table form for either key, cargo can't merge the two
+and every build fails at once, rather than building against the warm cache. `--sccache off` clears the rustc wrapper. Baseline and damper runs
 use separate fresh directories, so neither sees the other's files. Inherited
 `MAKEFLAGS`, `MFLAGS`, `CARGO_MAKEFLAGS`, `RUSTC_WRAPPER` and the sccache
 variables are removed from the builds' environment.
