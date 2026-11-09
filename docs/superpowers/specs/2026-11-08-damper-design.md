@@ -131,7 +131,7 @@ A single global FIFO has no owner tracking. Tokens held by a process that gets k
   - The shim detects the case when the inherited `CARGO_MAKEFLAGS` points at a live damper session FIFO, or when a `DAMPER_SESSION` variable set by the outer shim is present. It then passes straight through: no new session, no hold, same FIFO.
   - Subcommands cargo starts through `$CARGO` skip the shim anyway and inherit the FIFO the same way.
   - A nested build is never held, so an outer session can't deadlock waiting on its own inner build. **[call]**
-- **A session counts only while it compiles.** Cargo returns its tokens when compilation ends. For the floor (§5.5) and fairness, a session counts as active only while compiler or linker processes (rustc, the linker, sccache jobs) run in its process tree. A long `cargo run` or a test run therefore doesn't keep a slot. **[call]** Tests are accounted for separately (§5.6).
+- **A session counts only while it compiles.** Cargo returns its tokens when compilation ends. For the floor (§5.5) and fairness, a session counts as active only while compiler or linker processes run in its process tree: rustc, the linker, or an sccache client waiting on a compile. With sccache, rustc itself runs under the sccache server, outside the tree (Phase 0), so the client stands for it. A long `cargo run` or a test run therefore doesn't keep a slot. **[call]** Tests are accounted for separately (§5.6).
 - **rust-analyzer's `cargo check` gets a session like any build**, because it uses real memory. But it's never held, only slowed: the shim recognises rust-analyzer as the parent and skips the hold. **[guess]**: the builder confirms a reliable way to recognise it, such as an env var rust-analyzer sets or the parent process name. Without a reliable signal, it's treated as a normal build.
 
 ### 5.5 Floors
@@ -167,7 +167,7 @@ Inputs, sampled every second or event-driven where macOS offers it. **[call]**
 - The system memory-pressure level: `kern.memorystatus_vm_pressure_level` (normal, warning, critical), polled every second, plus a dispatch memory-pressure source if it fires in a user agent. Phase 0 confirmed both are readable without privileges, but couldn't make events fire (simulating them needs root), so the polled sysctl is the input the policy relies on. **[call]**
 - `kern.memorystatus_level`, the percentage of memory available.
 - The trend in swap use (`vm.swapusage`) and in the compressor's size.
-- The physical footprint of each session's process tree (`proc_pid_rusage`, `ri_phys_footprint`), which works on the user's own processes without privileges.
+- The physical footprint of the build processes (`proc_pid_rusage`, `ri_phys_footprint`), which works on the user's own processes without privileges. Build processes are every session's process tree *plus* the children of the user's sccache server, because with sccache rustc runs under the server, not under cargo (Phase 0). The policy needs only the total, not a figure per session. **[call]**
 - CPU load is a secondary input only. Utility QoS already makes builds give way to interactive work on CPU.
 
 **Why not an average per job.** Phase 0 measured warden's release build: the median job peaks at 41 MB, the p90 at 120 MB, and one job (the final binary's crate) at 1.3 GB. An average per job either starves the many small jobs or lets the big one through with no room. So the pool is sized by a closed loop on the measured total instead. (owner's decision, 2026-11-09)
