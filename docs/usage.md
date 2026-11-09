@@ -72,8 +72,9 @@ a build, list it in `extra_build_subcommands`.
 The file is `~/.config/damper/config.toml`, with the home directory taken from
 the passwd database, not `$HOME`. When `DAMPER_STATE_DIR` is set (development
 and testing), the state and the config both live under it, and the file is
-`$DAMPER_STATE_DIR/config.toml`. The daemon reads it at start; restart it after
-a change. A bad value falls back to its default with one warning naming the key;
+`$DAMPER_STATE_DIR/config.toml`. The daemon checks the file's modification time
+every second and reloads it when it changes, logging `config loaded`; no restart
+is needed. A bad value falls back to its default with one warning naming the key;
 the other keys are kept. A file that is not valid TOML gives all defaults with one
 warning. Unknown keys are ignored with a warning. A `DAMPER_STATE_DIR` that
 contains whitespace (it can't go in `MAKEFLAGS`) or is too long for the socket
@@ -128,6 +129,9 @@ not forwarded, because the terminal has already signalled cargo; other signals
 damper fails open, silently:
 
 - Daemon not running: the shim runs plain cargo at the configured priority.
-- Daemon dies mid-build: the shim refills the jobserver FIFO itself, so the
-  build carries on without limits.
+- Daemon dies or hangs mid-build: the shim refills the jobserver FIFO itself,
+  so the build carries on without limits. It records this as a shim fallback,
+  which `damper log` shows within a few seconds of the daemon running again. A
+  daemon that only hung also hears how many tokens the shim added, and takes
+  them back under memory pressure.
 - Daemon restarts: running builds keep running.
