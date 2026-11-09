@@ -17,12 +17,17 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// Why the shim fed the FIFO itself once cargo was running.
+const DAEMON_LOST: &str = "daemon closed or went silent mid-build; fed the FIFO itself";
+/// Why the shim fed the FIFO itself when it could not watch the daemon.
+const NO_WATCHER: &str = "cannot watch the daemon mid-build; fed the FIFO itself";
 
 /// What `main` does once the session path is done.
 pub enum Outcome {
@@ -64,6 +69,8 @@ pub fn run(paths: &Paths, inv: &Invocation, cargo: impl Fn() -> Command) -> Outc
         Ok(file) => Arc::new(Fifo {
             file,
             self_fed: AtomicBool::new(false),
+            paths: paths.clone(),
+            cwd: cwd.clone(),
         }),
         Err(e) => {
             record_fallback(paths, &format!("unusable session FIFO: {}", e.kind()), &cwd);
@@ -72,7 +79,7 @@ pub fn run(paths: &Paths, inv: &Invocation, cargo: impl Fn() -> Command) -> Outc
     };
     let mut command = cargo();
     command.envs(session_env(&fifo, &session, inv, threads));
-    let mut child = match spawn(&mut command, &phase) {
+    let child = match spawn(&mut command, &phase) {
         Ok(child) => child,
         Err(e) => {
             record_fallback(paths, &format!("cannot start cargo: {}", e.kind()), &cwd);
@@ -83,15 +90,29 @@ pub fn run(paths: &Paths, inv: &Invocation, cargo: impl Fn() -> Command) -> Outc
     // step's panic is caught and the shim goes on to wait for cargo.
     let pid = child.id();
     let _ = catch_unwind(AssertUnwindSafe(|| start_watching(pid, client, &fed)));
-    let _ = catch_unwind(|| await_exit(pid));
-    // Cargo has exited but is not reaped, so its pid can't be reused while
-    // the signal thread may still forward to it.
-    *lock(&phase) = Phase::Done;
-    let status = child.wait();
+    let exited = catch_unwind(|| await_exit(pid)).unwrap_or(false);
+    let status = reap(child, &phase, exited);
     if fed.self_fed.load(Ordering::SeqCst) {
         unlink_if_same(&fifo, &fed.file);
     }
     Outcome::Exit(status.map_or(ExitCode::FAILURE, exit_as))
+}
+
+/// Reaps cargo and ends the `Running` phase.
+///
+/// When `exited` (cargo has exited, unreaped), the phase becomes `Done`
+/// first, so its pid can't be reused while the signal thread may still
+/// forward to it. Otherwise the wait for its exit failed and cargo may still
+/// be running: signals keep reaching it until it is reaped, accepting the
+/// short window after the reap in this degraded path only.
+fn reap(mut child: Child, phase: &SharedPhase, exited: bool) -> io::Result<ExitStatus> {
+    if exited {
+        *lock(phase) = Phase::Done;
+        return child.wait();
+    }
+    let status = child.wait();
+    *lock(phase) = Phase::Done;
+    status
 }
 
 /// The session FIFO, held open by the shim until cargo exits.
@@ -99,14 +120,19 @@ struct Fifo {
     file: File,
     /// Set once the shim has fed the FIFO itself, so it unlinks it at exit.
     self_fed: AtomicBool,
+    /// Where a self-feed is recorded.
+    paths: Paths,
+    /// The invocation's directory, for the record.
+    cwd: PathBuf,
 }
 
 impl Fifo {
-    /// Feeds the FIFO once with a token per spare core. The flag is set
+    /// Feeds the FIFO once with `tokens` and records why. The flag is set
     /// first, so cargo exiting mid-write can't leave the FIFO behind.
-    fn feed(&self) {
+    fn feed(&self, tokens: u32, reason: &str) {
         self.self_fed.store(true, Ordering::SeqCst);
-        let _ = self_feed(&self.file, spare_cores());
+        record_fallback(&self.paths, reason, &self.cwd);
+        let _ = self_feed(&self.file, tokens);
     }
 }
 
@@ -121,8 +147,10 @@ fn start_watching(pid: u32, mut client: Client, fifo: &Arc<Fifo>) {
             .spawn(move || watch_daemon(client, &fifo, HEARTBEAT_TIMEOUT))
     };
     if watched.is_err() {
-        // Without a watcher nobody notices a dead daemon, so feed now.
-        fifo.feed();
+        // Without a watcher nobody notices a dead daemon, so feed now. The
+        // client went with the closure, so the daemon is not told: its
+        // `observe` adopts what it finds above `given`.
+        fifo.feed(spare_cores(), NO_WATCHER);
     }
 }
 
@@ -138,15 +166,17 @@ fn spawn(command: &mut Command, phase: &SharedPhase) -> io::Result<Child> {
     Ok(child)
 }
 
-/// Blocks until the child `pid` exits, without reaping it. Returns early on
-/// a kqueue error: `ESRCH` means it has already exited, and for any other
-/// error the caller just reaps it, as it would without this wait.
-fn await_exit(pid: u32) {
-    let Ok(ident) = usize::try_from(pid) else {
-        return;
-    };
-    let Ok(kq) = Kqueue::new() else {
-        return;
+/// Blocks until the child `pid` exits, without reaping it. True once it has
+/// exited (`ESRCH` included: it already had); false if the wait failed and
+/// it may still be running.
+fn await_exit(pid: u32) -> bool {
+    wait_on(Kqueue::new(), pid)
+}
+
+/// [`await_exit`] on a given kqueue, so a failure can be injected.
+fn wait_on(kq: nix::Result<Kqueue>, pid: u32) -> bool {
+    let (Ok(ident), Ok(kq)) = (usize::try_from(pid), kq) else {
+        return false;
     };
     let exit = KEvent::new(
         ident,
@@ -156,14 +186,17 @@ fn await_exit(pid: u32) {
         0,
         0,
     );
-    if kq.kevent(&[exit], &mut [], None).is_err() {
-        return;
+    match kq.kevent(&[exit], &mut [], None) {
+        Ok(_) => {}
+        Err(Errno::ESRCH) => return true,
+        Err(_) => return false,
     }
     let mut events = [exit];
     loop {
         match kq.kevent(&[], &mut events, None) {
             Ok(0) | Err(Errno::EINTR) => {}
-            Ok(_) | Err(_) => return,
+            Ok(_) => return true,
+            Err(_) => return false,
         }
     }
 }
@@ -184,11 +217,18 @@ fn unlink_if_same(path: &Path, held: &File) {
 /// Reads the daemon's messages until it closes or stays silent for
 /// `silence`, then feeds the FIFO once so cargo finishes at full speed.
 /// Malformed or other-version messages are still signs of life.
+///
+/// Before feeding it tells the daemon how many tokens it adds, best effort:
+/// a hung daemon reads the line when it recovers and counts them as given,
+/// so it can drain them under pressure; a dead one fails the send.
 fn watch_daemon(mut client: Client, fifo: &Fifo, silence: Duration) {
     while let Ok(_) | Err(ProtoError::Json(_) | ProtoError::Version { .. }) =
         client.recv(Some(silence))
     {}
-    fifo.feed();
+    let tokens = spare_cores();
+    let _ = client.send(&ClientMsg::SelfFed { tokens });
+    drop(client);
+    fifo.feed(tokens, DAEMON_LOST);
 }
 
 /// One token per core beyond cargo's implicit slot.
@@ -214,76 +254,4 @@ fn exit_as(status: ExitStatus) -> ExitCode {
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "test")]
-mod tests {
-    use super::{Fifo, await_exit, spare_cores, watch_daemon};
-    use crate::fallback::open_fifo;
-    use damper_proto::{Client, ServerMsg, encode};
-    use nix::sys::stat::Mode;
-    use nix::unistd::mkfifo;
-    use std::fs::OpenOptions;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixListener;
-    use std::process::Command;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_silent_daemon_gets_the_fifo_fed_after_the_heartbeat_timeout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket = tmp.path().join("d.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let path = tmp.path().join("s.fifo");
-        mkfifo(&path, Mode::from_bits_truncate(0o600)).unwrap();
-        let fifo = Fifo {
-            file: open_fifo(&path, tmp.path()).unwrap(),
-            self_fed: AtomicBool::new(false),
-        };
-        let client = Client::connect(&socket, Duration::from_secs(5)).unwrap();
-        let (mut daemon, _) = listener.accept().unwrap();
-        // Alive at first: a heartbeat, then silence with the socket open.
-        daemon
-            .write_all(&encode(&ServerMsg::Heartbeat).unwrap())
-            .unwrap();
-        let started = Instant::now();
-        watch_daemon(client, &fifo, Duration::from_millis(300));
-        assert!(started.elapsed() >= Duration::from_millis(300));
-        assert!(fifo.self_fed.load(Ordering::SeqCst));
-        let spare = usize::try_from(spare_cores()).unwrap();
-        let mut reader = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let mut tokens = vec![0u8; spare];
-        reader.read_exact(&mut tokens).unwrap();
-        assert!(tokens.iter().all(|&t| t == b'+'), "{tokens:?}");
-        drop(daemon);
-    }
-
-    #[test]
-    fn await_exit_returns_for_a_child_that_already_exited() {
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        let pid = child.id();
-        // Long enough for it to exit and become an unreaped zombie.
-        thread::sleep(Duration::from_millis(300));
-        let (done, waited) = mpsc::channel();
-        thread::spawn(move || {
-            await_exit(pid);
-            done.send(()).unwrap();
-        });
-        waited.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(child.wait().unwrap().success());
-    }
-
-    #[test]
-    fn await_exit_waits_for_a_running_child() {
-        let mut child = Command::new("/bin/sleep").arg("0.3").spawn().unwrap();
-        let started = Instant::now();
-        await_exit(child.id());
-        assert!(started.elapsed() >= Duration::from_millis(250));
-        assert!(child.wait().unwrap().success());
-    }
-}
+mod tests;
