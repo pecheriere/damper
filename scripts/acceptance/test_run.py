@@ -12,7 +12,7 @@ GIB = 1024 * run.MIB
 
 def make_plan(argv: list[str] | None = None) -> run.Plan:
     """Return a plan under a fixed run dir."""
-    args = run.parse_args(["--mode", "baseline", *(argv or [])])
+    args = run.parse_args(["--mode", "baseline", "--ssd-dir", "/ssd", *(argv or [])])
     return run.make_plan(args, Path("/ssd/run-abc"), 4242)
 
 
@@ -32,19 +32,24 @@ class ParseArgsTests(unittest.TestCase):
         plan = make_plan()
         self.assertEqual(plan.builds, 5)
         self.assertEqual(plan.sccache, "cold")
-        self.assertEqual(plan.ssd_dir, Path("/Volumes/External SSD/damper-acceptance"))
+        self.assertEqual(plan.ssd_dir, Path("/ssd"))
         self.assertEqual(plan.target_dir(2), Path("/ssd/run-abc/target-2"))
         self.assertEqual(plan.build_dir(2), Path("/ssd/run-abc/build-2"))
 
     def test_mode_is_required(self) -> None:
         """No mode is an error."""
         with self.assertRaises(SystemExit):
-            run.parse_args([])
+            run.parse_args(["--ssd-dir", "/ssd"])
+
+    def test_ssd_dir_is_required(self) -> None:
+        """No default disk: the SSD dir must be given."""
+        with self.assertRaises(SystemExit):
+            run.parse_args(["--mode", "baseline"])
 
     def test_zero_builds_rejected(self) -> None:
         """At least one build."""
         with self.assertRaises(SystemExit):
-            run.parse_args(["--mode", "damper", "--builds", "0"])
+            run.parse_args(["--mode", "damper", "--ssd-dir", "/ssd", "--builds", "0"])
 
     def test_log_dir_defaults_next_to_output(self) -> None:
         """Logs are kept with the JSON."""
@@ -54,7 +59,7 @@ class ParseArgsTests(unittest.TestCase):
 
     def test_dry_run_prints_plan(self) -> None:
         """The description names the mode and every build."""
-        args = run.parse_args(["--mode", "damper", "--builds", "2"])
+        args = run.parse_args(["--mode", "damper", "--ssd-dir", "/ssd", "--builds", "2"])
         text = run.describe(run.make_plan(args, Path("/ssd/run-abc"), 0), "ok")
         self.assertIn("mode: damper", text)
         self.assertIn("build 1:", text)
@@ -93,9 +98,9 @@ class BuildPlanTests(unittest.TestCase):
 
     def test_paths_with_spaces_stay_one_argument(self) -> None:
         """Quoting is by TOML string, not by a shell."""
-        args = run.parse_args(["--mode", "baseline"])
-        cmd = run.build_command(run.make_plan(args, Path("/Volumes/External SSD/r"), 1), 0)
-        self.assertIn('build.build-dir="/Volumes/External SSD/r/build-0"', cmd)
+        args = run.parse_args(["--mode", "baseline", "--ssd-dir", "/Volumes/My SSD"])
+        cmd = run.build_command(run.make_plan(args, Path("/Volumes/My SSD/r"), 1), 0)
+        self.assertIn('build.build-dir="/Volumes/My SSD/r/build-0"', cmd)
 
     def test_env_strips_and_sets(self) -> None:
         """Make flags and wrapper go; CARGO_HOME stays; sccache gets its own dir."""
@@ -119,7 +124,7 @@ class BuildPlanTests(unittest.TestCase):
 
     def test_damper_mode_puts_shim_first(self) -> None:
         """The shim dir leads PATH; DAMPER is not set."""
-        args = run.parse_args(["--mode", "damper", "--sccache", "off"])
+        args = run.parse_args(["--mode", "damper", "--ssd-dir", "/ssd", "--sccache", "off"])
         plan = run.make_plan(args, Path("/r"), 0)
         env = run.build_env(plan, {"PATH": "/bin"}, Path("/shim"))
         self.assertTrue(env["PATH"].startswith("/shim:"))

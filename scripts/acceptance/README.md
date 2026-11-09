@@ -6,17 +6,18 @@ second. It uses only the standard library.
 
 ```sh
 # Check the plan first. Nothing is built.
-python3 -I scripts/acceptance/run.py --mode baseline --dry-run
+python3 -I scripts/acceptance/run.py --mode baseline --ssd-dir "$SSD/damper-acceptance" --dry-run
 
 # Baseline: DAMPER=off, plain cargo.
-python3 -I scripts/acceptance/run.py --mode baseline --output baseline.json
+python3 -I scripts/acceptance/run.py --mode baseline --ssd-dir "$SSD/damper-acceptance" --output baseline.json
 
 # damper: needs damperd running and the shim installed (docs/usage.md).
-python3 -I scripts/acceptance/run.py --mode damper --output damper.json
+python3 -I scripts/acceptance/run.py --mode damper --ssd-dir "$SSD/damper-acceptance" --output damper.json
 ```
 
-Options: `--warden` (default `~/Code/warden`), `--builds` (5), `--ssd-dir`
-(`/Volumes/External SSD/damper-acceptance`; refused if it is on the internal disk),
+`--mode` and `--ssd-dir` are required. `$SSD` above is the mount point of an
+external disk, such as `/Volumes/<name>`; the SSD dir is refused if it is on the
+internal disk. Options: `--warden` (default `~/Code/warden`), `--builds` (5),
 `--sccache {cold,off}` (cold), `--shim-dir` (`~/.local/share/damper/shim`), `--output`, `--log-dir`, `--dry-run`.
 Each run makes its own fresh directory under the SSD dir and deletes only that
 (and the SSD dir itself if the run created it), also when a build fails or the

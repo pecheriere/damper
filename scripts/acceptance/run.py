@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 CRITICAL_LEVEL = 4
 PROBE_SLEEP = 0.010
 MIB = 1024 * 1024
-DEFAULT_SSD_DIR = Path("/Volumes/External SSD/damper-acceptance")
 # Inherited variables that would change what the builds do. CARGO_HOME and the rest of
 # CARGO_* are kept; the sccache variables are set explicitly per mode.
 STRIPPED_ENV = frozenset(
@@ -127,8 +126,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--ssd-dir",
         type=Path,
-        default=DEFAULT_SSD_DIR,
-        help="parent of this run's fresh directory; must be on the external SSD",
+        required=True,
+        help="parent of this run's fresh directory; must be on an external disk",
     )
     parser.add_argument(
         "--sccache",
