@@ -7,6 +7,7 @@ pub mod client;
 pub mod event;
 pub mod framing;
 pub mod msg;
+pub mod paths;
 pub mod status;
 
 #[cfg(test)]

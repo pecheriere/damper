@@ -9,3 +9,13 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+damper-proto = { version = "0.1.0", path = "../proto" }
+nix = { version = "0.31.3", features = ["fs", "event", "signal", "user", "process"] }
+rustix = "1.1.6"
+tokio = { version = "1.54.1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.54.1", features = ["macros", "rt", "time", "sync"] }
