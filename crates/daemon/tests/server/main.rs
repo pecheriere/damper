@@ -198,3 +198,4 @@ fn is_rejected(kind: &EventKind) -> bool {
 
 mod basics;
 mod limits;
+mod self_fed;

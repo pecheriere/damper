@@ -51,6 +51,8 @@ pub(crate) enum Request {
     },
     /// The session's cargo started.
     Started { session: SessionId, cargo_pid: u32 },
+    /// The shim fed its FIFO `tokens` itself (ruling R22).
+    SelfFed { session: SessionId, tokens: u32 },
     /// The session's connection closed.
     Closed { session: SessionId },
     /// The current status.
@@ -263,6 +265,7 @@ impl Conn {
                 };
                 self.open(req).await
             }
+            ClientMsg::SelfFed { tokens } => self.self_fed(tokens).await,
             ClientMsg::Started { cargo_pid } => {
                 let Some((session, _)) = &self.session else {
                     self.reject("started before open".to_owned()).await;
@@ -291,6 +294,24 @@ impl Conn {
                     Err(_) => Next::Close,
                 }
             }
+        }
+    }
+
+    /// Forwards a self-feed report for this connection's session.
+    async fn self_fed(&mut self, tokens: u32) -> Next {
+        let Some((session, _)) = &self.session else {
+            self.reject("self_fed before open".to_owned()).await;
+            return Next::Close;
+        };
+        let session = session.clone();
+        match self
+            .shared
+            .requests
+            .send(Request::SelfFed { session, tokens })
+            .await
+        {
+            Ok(()) => Next::Continue,
+            Err(_) => Next::Close,
         }
     }
 

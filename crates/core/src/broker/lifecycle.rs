@@ -110,6 +110,25 @@ impl Broker {
         ]
     }
 
+    /// The shim lost the daemon mid-build and fed its FIFO `tokens` itself
+    /// (ruling R22): they count as given, so drains can take them back under
+    /// pressure, the session is not hungry on top of them, and a close
+    /// recovers them. Logged as a `ShimFallback`. Unknown sessions are
+    /// ignored.
+    pub fn self_fed(&mut self, session: &SessionId, tokens: u32) -> Vec<Action> {
+        let Some(index) = self.index(session) else {
+            return Vec::new();
+        };
+        let s = &mut self.sessions[index];
+        s.given = s.given.saturating_add(tokens);
+        vec![Action::Log(EventKind::ShimFallback {
+            reason: format!(
+                "session {session}: the shim fed {tokens} tokens itself after losing the daemon; counted as given"
+            ),
+            cwd: s.req.cwd.clone(),
+        })]
+    }
+
     /// The shim's connection closed. The session closes now unless cargo
     /// started and is still running.
     pub fn connection_closed(&mut self, session: &SessionId, now: Instant) -> Vec<Action> {

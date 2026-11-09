@@ -28,6 +28,12 @@ fn round_trips_every_message() {
 }
 
 #[test]
+fn self_fed_wire_format() {
+    let line = encode(&ClientMsg::SelfFed { tokens: 9 }).unwrap();
+    assert_eq!(line, b"{\"v\":1,\"type\":\"self_fed\",\"tokens\":9}\n");
+}
+
+#[test]
 fn snapshot_wire_format() {
     let open = ClientMsg::Open {
         cwd: "/work/demo".into(),

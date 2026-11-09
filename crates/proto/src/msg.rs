@@ -53,6 +53,12 @@ pub enum ClientMsg {
     Started {
         cargo_pid: u32,
     },
+    /// The shim found the daemon closed or silent mid-build and wrote
+    /// `tokens` into its FIFO itself. Sent best effort before the feed, so a
+    /// daemon that recovers counts them as given.
+    SelfFed {
+        tokens: u32,
+    },
     Status,
     Log {
         since_ms: Option<u64>,

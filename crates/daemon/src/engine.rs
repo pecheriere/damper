@@ -263,6 +263,10 @@ impl Engine {
                 let actions = self.broker.started(&session, cargo_pid);
                 self.apply(actions);
             }
+            Request::SelfFed { session, tokens } => {
+                let actions = self.broker.self_fed(&session, tokens);
+                self.apply(actions);
+            }
             Request::Closed { session } => {
                 self.clients.remove(&session);
                 let actions = self.broker.connection_closed(&session, now);

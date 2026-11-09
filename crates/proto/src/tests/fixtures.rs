@@ -78,6 +78,7 @@ pub fn client_msgs() -> Vec<ClientMsg> {
             nested: true,
         },
         ClientMsg::Started { cargo_pid: 9 },
+        ClientMsg::SelfFed { tokens: 7 },
         ClientMsg::Status,
         ClientMsg::Log {
             since_ms: Some(5),

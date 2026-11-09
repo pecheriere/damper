@@ -14,6 +14,7 @@ use crate::classify::Kind;
 use crate::config::{Effective, Priority};
 
 mod lifecycle;
+mod self_fed;
 mod shares;
 
 const GIB: u64 = 1 << 30;

@@ -62,6 +62,12 @@ impl Broker {
         let mut owners = Vec::new();
         for (index, s) in self.sessions.iter_mut().enumerate() {
             s.fill = input.fifo_fill.get(&s.id).copied();
+            // In normal operation fill ≤ given. Anything above is foreign
+            // tokens (a shim's self-feed the daemon never heard of), adopted
+            // so drains and `tokens_recovered` cover them.
+            if let Some(fill) = s.fill {
+                s.given = s.given.max(fill);
+            }
             s.compiling = false;
             s.test_jobs = 0;
             if let Some(root_pid) = s.running_pid() {
