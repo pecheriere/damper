@@ -58,10 +58,9 @@ impl Daemon {
 }
 
 fn paths(dir: &TempDir) -> Paths {
-    let mut p = resolve_paths_from(Some(&dir.path().join("state"))).unwrap();
-    // Never read the developer's own config.
-    p.config = dir.path().join("config.toml");
-    p
+    // The state override also puts the config inside the state dir, so the
+    // developer's own config is never read.
+    resolve_paths_from(Some(&dir.path().join("state"))).unwrap()
 }
 
 fn spawn(p: &Paths, opts: Options) -> Daemon {

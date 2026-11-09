@@ -13,7 +13,7 @@ use damper_core::config::{Effective, Machine, Priority, load};
 use damper_proto::paths::{Paths, resolve_paths, resolve_paths_from};
 use decide::{Route, ShimEnv, route};
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -35,26 +35,54 @@ fn main() -> ExitCode {
     else {
         return fail(NO_CARGO, 127);
     };
-    let priority =
-        catch_unwind(AssertUnwindSafe(|| decide_priority(&args))).unwrap_or(Priority::None);
-    let wrapped = launch::command_for(
+    let wrapped = guarded(
+        || {
+            let priority = decide_priority(&args);
+            launch::command_for(
+                &cargo,
+                &args,
+                priority,
+                Path::new(launch::TASKPOLICY),
+                Path::new(launch::NICE),
+            )
+        },
         &cargo,
         &args,
-        priority,
-        Path::new(launch::TASKPOLICY),
-        Path::new(launch::NICE),
     );
     exec_or_fall_back(wrapped, &cargo, &args)
 }
 
+/// Runs `build`; if it panics, the command is cargo itself with no wrapper.
+fn guarded(build: impl FnOnce() -> Command, cargo: &Path, args: &[OsString]) -> Command {
+    catch_unwind(AssertUnwindSafe(build)).unwrap_or_else(|_| direct_command(cargo, args))
+}
+
+fn direct_command(cargo: &Path, args: &[OsString]) -> Command {
+    let mut command = Command::new(cargo);
+    command.args(args);
+    command
+}
+
 /// Execs `command`; if that fails, execs cargo directly; if that fails too,
-/// reports it.
+/// reports the error kind (never the arguments or environment).
 fn exec_or_fall_back(mut command: Command, cargo: &Path, args: &[OsString]) -> ExitCode {
     let _ = command.exec();
-    let mut direct = Command::new(cargo);
-    direct.args(args);
-    let _ = direct.exec();
-    fail("damper: cannot execute cargo\n", 126)
+    let error = direct_command(cargo, args).exec();
+    let kind = error.kind();
+    fail(&exec_failure_message(kind), exec_failure_code(kind))
+}
+
+fn exec_failure_message(kind: io::ErrorKind) -> String {
+    format!("damper: cannot execute cargo: {kind}\n")
+}
+
+/// 127 for "not found", 126 for anything else, as shells do.
+fn exec_failure_code(kind: io::ErrorKind) -> u8 {
+    if kind == io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    }
 }
 
 fn fail(message: &str, code: u8) -> ExitCode {
@@ -124,6 +152,38 @@ fn names_fifo_in(flags: &OsStr, run_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_before_exec_falls_back_to_plain_cargo() {
+        let args = vec![OsString::from("build")];
+        let cargo = Path::new("/x/cargo");
+        let c = guarded(|| panic!("boom"), cargo, &args);
+        assert_eq!(c.get_program(), cargo.as_os_str());
+        assert_eq!(c.get_args().collect::<Vec<_>>(), [OsStr::new("build")]);
+    }
+
+    #[test]
+    fn exec_failures_map_to_shell_exit_codes() {
+        assert_eq!(exec_failure_code(io::ErrorKind::NotFound), 127);
+        assert_eq!(exec_failure_code(io::ErrorKind::PermissionDenied), 126);
+        assert_eq!(
+            exec_failure_message(io::ErrorKind::NotFound),
+            "damper: cannot execute cargo: entity not found\n"
+        );
+    }
+
+    #[test]
+    fn config_text_selects_the_priority() {
+        let text = |p: &str| format!("priority = \"{p}\"\n");
+        for (name, expected) in [
+            ("utility", Priority::Utility),
+            ("nice", Priority::Nice),
+            ("none", Priority::None),
+        ] {
+            assert_eq!(effective_config(Some(&text(name))).priority, expected);
+        }
+        assert_eq!(effective_config(None).priority, Priority::Utility);
+    }
 
     #[test]
     fn fifo_in_run_dir_is_nested() {

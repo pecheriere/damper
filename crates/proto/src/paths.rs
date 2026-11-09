@@ -95,7 +95,9 @@ pub struct Paths {
     pub log: PathBuf,
     /// `<state>/disabled`.
     pub disabled: PathBuf,
-    /// `<pw_dir>/.config/damper/config.toml`.
+    /// `<pw_dir>/.config/damper/config.toml`, or `<state>/config.toml` when the
+    /// state directory is overridden (development and tests keep everything
+    /// under one directory and never read the user's real config).
     pub config: PathBuf,
 }
 
@@ -113,6 +115,9 @@ pub fn resolve_paths() -> Result<Paths, PathError> {
 
 /// Resolve the paths with an optional state-directory override.
 ///
+/// With an override, the config file is `<override>/config.toml`; without
+/// one it is `<pw_dir>/.config/damper/config.toml`.
+///
 /// # Errors
 /// [`PathError::NoHome`] without a passwd entry, [`PathError::NotAbsolute`],
 /// [`PathError::Whitespace`] or [`PathError::SocketTooLong`] for an unusable
@@ -127,6 +132,11 @@ pub fn resolve_paths_from(state_override: Option<&Path>) -> Result<Paths, PathEr
         || home.join(".local").join("state").join("damper"),
         Path::to_path_buf,
     );
+    let config = if state_override.is_some() {
+        state.join("config.toml")
+    } else {
+        home.join(".config").join("damper").join("config.toml")
+    };
     if !state.is_absolute() {
         return Err(PathError::NotAbsolute(state));
     }
@@ -143,7 +153,7 @@ pub fn resolve_paths_from(state_override: Option<&Path>) -> Result<Paths, PathEr
         lock: run.join("damperd.lock"),
         log: state.join("log"),
         disabled: state.join("disabled"),
-        config: home.join(".config").join("damper").join("config.toml"),
+        config,
         run,
         socket,
         state,

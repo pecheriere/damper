@@ -34,7 +34,19 @@ fn paths_layout_follows_the_state_dir() {
     assert_eq!(p.lock, Path::new("/tmp/d/run/damperd.lock"));
     assert_eq!(p.log, Path::new("/tmp/d/log"));
     assert_eq!(p.disabled, Path::new("/tmp/d/disabled"));
+}
+
+#[test]
+fn config_lives_in_the_state_dir_when_overridden() {
+    let p = resolve_paths_from(Some(Path::new("/tmp/d"))).unwrap();
+    assert_eq!(p.config, Path::new("/tmp/d/config.toml"));
+}
+
+#[test]
+fn config_defaults_to_the_passwd_home() {
+    let p = resolve_paths_from(None).unwrap();
     assert!(p.config.ends_with(".config/damper/config.toml"));
+    assert!(p.state.ends_with(".local/state/damper"));
 }
 
 fn mode(path: &Path) -> u32 {
