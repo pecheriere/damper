@@ -1,0 +1,4 @@
+# A hung test fails instead of stalling the run: nextest has no limit by default.
+# Task 15 measures the slowest test and tunes these values.
+[profile.default]
+slow-timeout = { period = "10s", terminate-after = 3 }
