@@ -1,0 +1,17 @@
+---
+source: crates/cli/src/render/tests.rs
+expression: "render_events(&mixed(), NOW, false)"
+---
+  2h ago  limit 2 -> 4 (growth); pressure warning, 40% available, swap 3.0 MiB (growing), builds 3.0 GiB, reserve 2.0 GiB
+  1h ago  session 6543-1 opened: build in /work/demo (shim pid 4242)
+  1h ago  session 6543-1 started cargo (pid 777)
+ 10m ago  session 6543-1 now holds 3 tokens
+  2m ago  session 6543-2 held: memory pressure critical
+  1m ago  session 6543-2 released after 30s
+  1m ago  session 6543-3 released after 10m00s (waited the maximum and ran anyway)
+ 30s ago  session 6543-1 closed after 59m30s, recovered 2 tokens
+ 20s ago  shim ran cargo without damper in /work/demo: daemon not running
+ 15s ago  config loaded with 1 warning(s): unknown key `foo` ignored
+ 10s ago  client rejected: unsupported protocol version 9
+  5s ago  error: sampling failed
+  0s ago  limit 4 -> 2 (warning); pressure warning, 40% available, swap 3.0 MiB (growing), builds 3.0 GiB, reserve 2.0 GiB

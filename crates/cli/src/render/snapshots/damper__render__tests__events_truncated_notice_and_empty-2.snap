@@ -1,0 +1,5 @@
+---
+source: crates/cli/src/render/tests.rs
+expression: "render_events(&[], NOW, false)"
+---
+No events.

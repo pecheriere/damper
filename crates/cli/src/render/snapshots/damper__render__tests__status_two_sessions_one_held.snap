@@ -1,0 +1,12 @@
+---
+source: crates/cli/src/render/tests.rs
+expression: render_status(&status)
+---
+limit 6 of 10 cores (headroom), memory 32.0 GiB
+pressure warning, 40% available, swap 3.0 MiB (growing), builds 3.0 GiB, reserve 2.0 GiB
+holding builds: yes
+sessions (2):
+  6543-1  held 4s, 0 slots, 0 tokens, age 4s; build in /work/demo
+  6543-2  compiling, 3 slots, 2 tokens, age 1m35s; build in /work/other
+warnings:
+  - unknown key `foo` ignored

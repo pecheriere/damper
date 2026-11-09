@@ -1,0 +1,8 @@
+---
+source: crates/cli/src/render/tests.rs
+expression: render_status(&status)
+---
+limit 2 of 8 cores (startup), memory 16.0 GiB
+pressure normal, 40% available, swap 0 B, builds 3.0 GiB, reserve 2.0 GiB
+holding builds: no
+no sessions

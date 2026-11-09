@@ -1,0 +1,11 @@
+---
+source: crates/cli/src/render/tests.rs
+expression: "render_explain(&id, &events, NOW)"
+---
+Session 6543-2:
+  2m ago  session 6543-2 opened: build in /work/demo (shim pid 4242)
+  2m ago  limit 4 -> 2 (critical); pressure warning, 40% available, swap 3.0 MiB (growing), builds 3.0 GiB, reserve 2.0 GiB
+  2m ago  session 6543-2 held: memory pressure critical
+  1m ago  session 6543-2 released after 30s
+  1m ago  session 6543-2 started cargo (pid 901)
+  1s ago  session 6543-2 closed after 2m09s, recovered 1 tokens
