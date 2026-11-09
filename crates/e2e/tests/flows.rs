@@ -40,6 +40,14 @@ fn build_gets_tokens_and_returns_them() {
 #[test]
 fn two_builds_share_fairly() {
     let mut env = Env::new();
+    // The pool never outgrows the machine's cores, so cap it at four: then
+    // every machine with four cores or more settles on the same split, and a
+    // smaller one (GitHub's macOS runner has three) on the most it can give.
+    let cores = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(4);
+    env.config(&format!("cores = {cores}\n"));
+    let cores = u32::try_from(cores).unwrap();
     env.start_daemon();
     let barrier = env.file("go");
     let reports = [env.file("r1"), env.file("r2")];
@@ -60,10 +68,12 @@ fn two_builds_share_fairly() {
         .collect();
     let sessions: Vec<SessionId> = builds.iter().map(|b| env.session_of(b.pid())).collect();
     // Start the jobs together, once the daemon has settled on a split: both
-    // compiling, each with two slots at least (a token on top of its implicit
-    // slot), their slots at most one apart. (Status's `tokens_outstanding`
-    // counts only tokens cargo took, none before the barrier.)
-    wait_until("both sessions to compile, each with a token", || {
+    // compiling, sharing every core between them, their slots at most one
+    // apart. With four cores that is a token each on top of each implicit
+    // slot; with three, one build gets the only token. (Status's
+    // `tokens_outstanding` counts only tokens cargo took, none before the
+    // barrier.)
+    wait_until("both sessions to compile, sharing every core", || {
         let status = env.status();
         let slots: Vec<u32> = sessions
             .iter()
@@ -75,8 +85,9 @@ fn two_builds_share_fairly() {
                     .map(|s| s.slots)
             })
             .collect();
-        let settled =
-            slots.len() == 2 && slots.iter().all(|n| *n >= 2) && slots[0].abs_diff(slots[1]) <= 1;
+        let settled = slots.len() == 2
+            && slots.iter().sum::<u32>() >= cores
+            && slots[0].abs_diff(slots[1]) <= 1;
         settled.then_some(())
     });
     std::fs::write(&barrier, b"").unwrap();
@@ -92,7 +103,12 @@ fn two_builds_share_fairly() {
     assert!(from < to, "the builds never ran together");
     let (pa, pb) = (a.peak_between(from, to), b.peak_between(from, to));
     assert!(pa.abs_diff(pb) <= 1, "unfair split: {pa} against {pb}");
-    assert!(pa.max(pb) >= 2, "no build ran a job on a token");
+    // The larger share, a token on top of the implicit slot once there are
+    // three cores or more.
+    assert!(
+        pa.max(pb) >= cores.div_ceil(2),
+        "no build ran a job on a token"
+    );
 }
 
 #[test]

@@ -7,6 +7,11 @@ use tokio::time::{Duration, sleep};
 
 use super::{Conn, open_session, paths, start, wait_for_event};
 
+/// Logical cores, as the daemon reads them to cap self-fed tokens.
+fn machine_cores() -> u32 {
+    u32::try_from(std::thread::available_parallelism().unwrap().get()).unwrap()
+}
+
 struct Killed(Child);
 
 impl Drop for Killed {
@@ -42,23 +47,27 @@ async fn self_fed_tokens_count_as_held_after_the_connection_closes() {
     })
     .await;
     // What a shim does on finding the daemon silent: report, then hang up.
-    conn.send(&ClientMsg::SelfFed { tokens: 5 }).await;
+    // It reports more than this machine has, so the daemon counts only its
+    // core count, whatever the machine running the test.
+    let cores = machine_cores();
+    conn.send(&ClientMsg::SelfFed { tokens: cores + 2 }).await;
     drop(conn);
+    let fed = format!("fed {cores} tokens");
     wait_for_event(
         &p,
-        |k| matches!(k, EventKind::ShimFallback { reason, .. } if reason.contains("fed 5 tokens")),
+        |k| matches!(k, EventKind::ShimFallback { reason, .. } if reason.contains(&fed)),
     )
     .await;
     let mut outstanding = 0;
     for _ in 0..200 {
         let status = Conn::new(&p.socket).await.status().await;
         outstanding = status.sessions.first().map_or(0, |s| s.tokens_outstanding);
-        if outstanding == 5 {
+        if outstanding == cores {
             break;
         }
         sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(outstanding, 5);
+    assert_eq!(outstanding, cores);
     drop(cargo);
     d.stop().await.unwrap();
 }
