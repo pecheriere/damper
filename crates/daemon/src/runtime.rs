@@ -33,6 +33,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
+use crate::engine::fallbacks::Fallbacks;
 use crate::engine::{ConfigWatch, Engine};
 use crate::eventlog::EventLog;
 use crate::fifo::sweep_stale_fifos;
@@ -47,6 +48,8 @@ const MAX_CONNECTIONS: usize = MAX_SESSIONS * 2;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Requests queued for the broker task.
 const REQUEST_QUEUE: usize = 256;
+/// The shims' fallback file, in the log directory.
+const FALLBACKS: &str = "fallbacks.jsonl";
 
 /// Settings for [`run_until`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +156,7 @@ pub async fn run_until(
         let message = format!("removing stale FIFO {}: {e}", path.display());
         log.send(EventKind::Error { message }).ok();
     }
-    if let Err(e) = eventlog.ingest_fallbacks(&paths.log.join("fallbacks.jsonl")) {
+    if let Err(e) = eventlog.ingest_fallbacks(&paths.log.join(FALLBACKS)) {
         let message = format!("ingesting shim fallbacks: {e}");
         log.send(EventKind::Error { message }).ok();
     }
@@ -266,6 +269,7 @@ async fn serve_all(
         procs_failing: false,
         fill_failing: HashSet::new(),
         polled: HashSet::new(),
+        fallbacks: Fallbacks::new(Arc::clone(events), paths.log.join(FALLBACKS)),
     };
     engine.tick().await;
 

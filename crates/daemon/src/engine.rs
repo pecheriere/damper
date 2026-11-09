@@ -17,11 +17,13 @@ use damper_core::config::{Loaded, Machine, load};
 use damper_proto::{EventKind, ServerMsg, SessionId};
 use tokio::sync::mpsc::{self, error::TrySendError};
 
+use crate::engine::fallbacks::Fallbacks;
 use crate::fifo::SessionFifo;
 use crate::pidwatch::PidWatcher;
 use crate::server::{LogTx, Request};
 use crate::sources::{MemorySource, ProcessSource, Snapshot};
 
+pub(crate) mod fallbacks;
 mod liveness;
 #[cfg(test)]
 mod tests;
@@ -85,6 +87,8 @@ struct Samples {
     snapshot: io::Result<Snapshot>,
     /// The config's new mtime and text, when the mtime changed.
     config: Option<(Option<SystemTime>, io::Result<Option<String>>)>,
+    /// How many shim fallbacks were moved into the log, when due this tick.
+    ingested: Option<io::Result<u32>>,
 }
 
 /// The broker task's state.
@@ -107,6 +111,8 @@ pub(crate) struct Engine {
     pub(crate) fill_failing: HashSet<SessionId>,
     /// Pids the watcher refused, checked for exit every tick instead.
     pub(crate) polled: HashSet<u32>,
+    /// The shims' fallback file, moved into the log every few ticks.
+    pub(crate) fallbacks: Fallbacks,
 }
 
 impl Engine {
@@ -156,12 +162,14 @@ impl Engine {
         let procs = Arc::clone(&self.procs);
         let path = self.config.path.clone();
         let last = self.config.mtime;
+        let ingest = self.fallbacks.job();
         let samples = tokio::task::spawn_blocking(move || {
             let now = mtime(&path);
             Samples {
                 memory: memory.sample(),
                 snapshot: procs.snapshot(),
                 config: (now != last).then(|| (now, read_config(&path))),
+                ingested: ingest.map(|ingest| ingest()),
             }
         })
         .await;
@@ -169,6 +177,9 @@ impl Engine {
             Ok(samples) => samples,
             Err(e) => return self.error(format!("sampling task failed: {e}")),
         };
+        if let Some(message) = samples.ingested.and_then(|r| self.fallbacks.outcome(r)) {
+            self.error(message);
+        }
         if let Some((mtime, text)) = samples.config {
             self.config.mtime = mtime;
             let loaded = load_config(text, self.config.machine);

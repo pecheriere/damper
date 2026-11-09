@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use damper_core::broker::{Broker, MemorySample};
@@ -11,7 +11,9 @@ use damper_core::config::{Machine, load};
 use damper_proto::EventKind;
 use tokio::sync::mpsc;
 
+use super::fallbacks::{Fallbacks, INGEST_EVERY};
 use super::{ConfigWatch, Engine};
+use crate::eventlog::EventLog;
 use crate::pidwatch::PidWatcher;
 use crate::sources::{MemorySource, ProcessSource, Snapshot};
 
@@ -41,6 +43,8 @@ async fn polled_pids_are_checked_even_while_memory_reads_fail() {
     let loaded = load(None, machine);
     let (exit_tx, _exits) = mpsc::channel(8);
     let (log, mut events) = mpsc::unbounded_channel();
+    let event_log = Arc::new(Mutex::new(EventLog::open(dir.path()).unwrap()));
+    let fallbacks_file = dir.path().join("fallbacks.jsonl");
     let mut engine = Engine {
         broker: Broker::new(loaded.effective, loaded.warnings, 0, Instant::now()),
         fifos: HashMap::new(),
@@ -59,6 +63,7 @@ async fn polled_pids_are_checked_even_while_memory_reads_fail() {
         procs_failing: false,
         fill_failing: HashSet::new(),
         polled: HashSet::new(),
+        fallbacks: Fallbacks::new(Arc::clone(&event_log), fallbacks_file.clone()),
     };
     let mut child = Command::new("/usr/bin/true").spawn().unwrap();
     let gone = child.id();
@@ -74,4 +79,23 @@ async fn polled_pids_are_checked_even_while_memory_reads_fail() {
             matches!(kind, EventKind::Error { ref message } if message.contains("memory"));
     }
     assert!(saw_memory_error, "the memory failure was not logged");
+
+    // A shim fell back while the daemon runs: within a few ticks its record
+    // is in the log, memory failing or not.
+    std::fs::write(
+        &fallbacks_file,
+        "{\"ts_ms\":5,\"type\":\"shim_fallback\",\"reason\":\"fed\",\"cwd\":\"/w\"}\n",
+    )
+    .unwrap();
+    for _ in 1..INGEST_EVERY {
+        engine.tick().await;
+    }
+    assert!(!fallbacks_file.exists(), "the fallbacks were not ingested");
+    let logged = event_log.lock().unwrap().read(None).unwrap();
+    assert!(
+        logged
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ShimFallback { reason, .. } if reason == "fed")),
+        "{logged:?}"
+    );
 }
