@@ -31,6 +31,11 @@ use session::Session;
 /// The most sessions open at once; further opens fail and the shim falls back.
 pub const MAX_SESSIONS: usize = 256;
 
+/// How many ticks a granted session whose cargo is running still counts as
+/// about to compile (and so takes a share from a session granted now) before
+/// it is treated as idle. An up-to-date `cargo run` never compiles.
+pub const ABOUT_TO_COMPILE_TICKS: u32 = 5;
+
 /// A shim asking for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {

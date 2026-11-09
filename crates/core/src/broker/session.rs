@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use damper_proto::{HoldReason, SessionId, SessionState, SessionStatus};
 
-use super::OpenRequest;
+use super::{ABOUT_TO_COMPILE_TICKS, OpenRequest};
 use crate::allocate::Demand;
 
 /// Where a session is in its life (spec §5.3).
@@ -48,6 +48,9 @@ pub(super) struct Session {
     pub(super) compiling: bool,
     /// A compile process has run in the tree at some tick.
     pub(super) has_compiled: bool,
+    /// Ticks seen with cargo running and no compile yet; stops at
+    /// `ABOUT_TO_COMPILE_TICKS`.
+    pub(super) idle_ticks: u32,
     /// Test binaries running at the last tick.
     pub(super) test_jobs: u32,
 }
@@ -66,6 +69,7 @@ impl Session {
             fill: None,
             compiling: false,
             has_compiled: false,
+            idle_ticks: 0,
             test_jobs: 0,
         }
     }
@@ -89,9 +93,17 @@ impl Session {
 
     /// Granted but not compiling yet, and not running tests (whose jobs come
     /// out of the pool already): it will want its share soon, so a session
-    /// granted now must not be told the whole pool is free.
+    /// granted now must not be told the whole pool is free. Only while cargo
+    /// has not started, or for `ABOUT_TO_COMPILE_TICKS` ticks after it has
+    /// without compiling (an up-to-date `cargo run` never will); never once
+    /// cargo has exited.
     pub(super) fn about_to_compile(&self) -> bool {
-        self.state == State::Granted && !self.has_compiled && self.test_jobs == 0
+        let waiting = match self.cargo {
+            Cargo::NotStarted => true,
+            Cargo::Running(_) => self.idle_ticks < ABOUT_TO_COMPILE_TICKS,
+            Cargo::Exited => false,
+        };
+        self.state == State::Granted && !self.has_compiled && self.test_jobs == 0 && waiting
     }
 
     /// This session's demand when sharing. A satisfied session is capped at

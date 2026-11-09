@@ -77,6 +77,9 @@ impl Broker {
             let s = &mut self.sessions[index];
             s.compiling = usage.compiling;
             s.has_compiled |= usage.compiling;
+            if !s.has_compiled {
+                s.idle_ticks = s.idle_ticks.saturating_add(1);
+            }
             s.test_jobs = usage.test_jobs;
         }
         accounting

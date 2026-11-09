@@ -7,7 +7,8 @@ use std::time::Instant;
 use damper_proto::{Pressure, ServerMsg, SessionId};
 
 use super::{broker, compiling, drained, fed, grow_to_cores, input, proc, req, secs, sent, start};
-use crate::broker::{Action, Broker};
+use crate::broker::{ABOUT_TO_COMPILE_TICKS, Action, Broker, OpenRequest};
+use crate::classify::Kind;
 
 fn granted_threads(actions: &[Action], s: &SessionId) -> Option<u32> {
     sent(actions, s).into_iter().find_map(|m| match m {
@@ -190,4 +191,67 @@ fn granted_session_not_yet_compiling_counts_for_the_next_grant() {
     // `a` already has the whole pool and can't give it back; the newcomer
     // gets its fair share alongside `a`, not the whole pool again.
     assert_eq!(granted_threads(&second, &c), Some(5));
+}
+
+/// An idle build session holds the limit at `cores`; then a `cargo run`
+/// session (cargo pid 600) is granted and its cargo, up to date, never
+/// compiles. Returns the next free second.
+fn grant_run_that_never_compiles(b: &mut Broker, t0: Instant, cores: u32) -> (SessionId, u64) {
+    let t = grow_then_idle(b, t0, cores);
+    let run = OpenRequest {
+        kind: Kind::Run,
+        ..req(200)
+    };
+    let r = start(b, secs(t0, t), run, 600);
+    (r, t)
+}
+
+/// One tick with both cargos alive and neither compiling.
+fn idle_tick(b: &mut Broker, t0: Instant, at: u64, r: &SessionId) {
+    b.tick(&input(
+        secs(t0, at),
+        Pressure::Normal,
+        vec![proc(500, 1, "cargo"), proc(600, 1, "cargo")],
+        &[(r, 0)],
+    ));
+}
+
+#[test]
+fn started_session_that_never_compiles_counts_for_a_few_ticks() {
+    let t0 = Instant::now();
+    let mut b = broker(10, t0);
+    let (r, t) = grant_run_that_never_compiles(&mut b, t0, 10);
+    for i in 0..ABOUT_TO_COMPILE_TICKS - 1 {
+        idle_tick(&mut b, t0, t + u64::from(i), &r);
+    }
+    let at = t + u64::from(ABOUT_TO_COMPILE_TICKS);
+    let (c, _) = b.open(secs(t0, at), req(300)).unwrap();
+    let granted = b.fifo_ready(&c, PathBuf::from("/run/c.fifo"), secs(t0, at));
+    assert_eq!(granted_threads(&granted, &c), Some(5));
+}
+
+#[test]
+fn started_session_that_never_compiles_stops_counting() {
+    let t0 = Instant::now();
+    let mut b = broker(10, t0);
+    let (r, t) = grant_run_that_never_compiles(&mut b, t0, 10);
+    for i in 0..ABOUT_TO_COMPILE_TICKS {
+        idle_tick(&mut b, t0, t + u64::from(i), &r);
+    }
+    let at = t + u64::from(ABOUT_TO_COMPILE_TICKS);
+    let (c, _) = b.open(secs(t0, at), req(300)).unwrap();
+    let granted = b.fifo_ready(&c, PathBuf::from("/run/c.fifo"), secs(t0, at));
+    assert_eq!(granted_threads(&granted, &c), Some(10));
+}
+
+#[test]
+fn session_whose_cargo_exited_does_not_count() {
+    let t0 = Instant::now();
+    let mut b = broker(10, t0);
+    let (_r, t) = grant_run_that_never_compiles(&mut b, t0, 10);
+    // Cargo exits; the shim's connection stays open.
+    b.pid_exited(600, secs(t0, t));
+    let (c, _) = b.open(secs(t0, t), req(300)).unwrap();
+    let granted = b.fifo_ready(&c, PathBuf::from("/run/c.fifo"), secs(t0, t));
+    assert_eq!(granted_threads(&granted, &c), Some(10));
 }
