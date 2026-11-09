@@ -58,6 +58,18 @@ pub enum PathError {
         /// Its permission bits.
         mode: u32,
     },
+    /// An ancestor of the state directory could be swapped by another user.
+    #[error(
+        "ancestor {path} (uid {owner}, mode {mode:o}) lets another user replace the state directory"
+    )]
+    UnsafeAncestor {
+        /// The ancestor directory.
+        path: PathBuf,
+        /// Its owner.
+        owner: u32,
+        /// Its permission bits, including the sticky bit.
+        mode: u32,
+    },
     /// An I/O error on a path.
     #[error("{path}: {source}")]
     Io {
@@ -141,16 +153,43 @@ pub fn resolve_paths_from(state_override: Option<&Path>) -> Result<Paths, PathEr
 /// Create the state, run and log directories (mode 0700) and verify them.
 ///
 /// Existing directories must be real directories (a symlink is refused, never
-/// followed), owned by the current user, with no group or other access.
+/// followed), owned by the current user, with no group or other access. Every
+/// ancestor of the state directory must be owned by the current user or root
+/// and not writable by group or others unless it has the sticky bit (as
+/// `/tmp` does); otherwise another user could rename the state directory away
+/// and put their own in its place.
 ///
 /// # Errors
 /// Any [`PathError`] for a directory that cannot be created or fails the checks.
 pub fn prepare_dirs(p: &Paths) -> Result<(), PathError> {
     if let Some(parent) = p.state.parent() {
         fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+        check_ancestors(parent)?;
     }
     for dir in [&p.state, &p.run, &p.log] {
         ensure_private_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Verify every directory from `/` down to `parent` (symlinks resolved first,
+/// so each component is a real directory) cannot be replaced by another user.
+fn check_ancestors(parent: &Path) -> Result<(), PathError> {
+    let resolved = fs::canonicalize(parent).map_err(|source| io_err(parent, source))?;
+    let uid = Uid::current().as_raw();
+    for dir in resolved.ancestors() {
+        let meta = fs::symlink_metadata(dir).map_err(|source| io_err(dir, source))?;
+        let mode = meta.permissions().mode() & 0o7777;
+        let owned = meta.uid() == uid || meta.uid() == 0;
+        let others_can_write = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        if !meta.file_type().is_dir() || !owned || (others_can_write && !sticky) {
+            return Err(PathError::UnsafeAncestor {
+                path: dir.to_path_buf(),
+                owner: meta.uid(),
+                mode,
+            });
+        }
     }
     Ok(())
 }

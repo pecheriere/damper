@@ -5,6 +5,7 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 use std::process::Command;
 
 use damper_proto::SessionId;
+use nix::sys::stat::{Mode, umask};
 
 use super::{SessionFifo, shim_pid_of, sweep_stale_fifos};
 
@@ -121,11 +122,45 @@ fn sweep_keeps_live_shim_fifo() {
     let other = dir.path().join("damperd.lock");
     fs::write(&other, b"").unwrap();
 
-    let removed = sweep_stale_fifos(dir.path()).unwrap();
+    let report = sweep_stale_fifos(dir.path()).unwrap();
 
-    assert_eq!(removed, vec![stale_path.clone()]);
+    assert_eq!(report.removed, vec![stale_path.clone()]);
+    assert!(report.failed.is_empty());
     assert!(!stale_path.exists());
     assert!(live.path().exists());
     assert!(regular.exists());
     assert!(other.exists());
+}
+
+#[test]
+fn fifo_mode_is_0600_whatever_the_umask() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = umask(Mode::from_bits_truncate(0o277));
+    let created = SessionFifo::create(dir.path(), 1234, &sid("masked"));
+    umask(old);
+    let fifo = created.unwrap();
+    let mode = fs::metadata(fifo.path()).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(fifo.feed(2).unwrap(), 2);
+    assert_eq!(fifo.fill().unwrap(), 2);
+}
+
+#[test]
+fn sweep_reports_removal_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let stale = SessionFifo::create(dir.path(), dead, &sid("stuck")).unwrap();
+    let stale_path = stale.path().to_path_buf();
+    // A read-only directory makes the unlink fail.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+
+    let report = sweep_stale_fifos(dir.path()).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(report.removed, Vec::<std::path::PathBuf>::new());
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].0, stale_path);
+    assert!(stale_path.exists());
 }

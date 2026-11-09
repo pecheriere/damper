@@ -37,7 +37,9 @@ impl Shared {
 
 /// Watches processes and reports their pids on a channel once they exit.
 ///
-/// Dropping the watcher stops its thread, which drops the channel's sender.
+/// Dropping the watcher asks its thread to stop, which drops the channel's
+/// sender. The thread is detached: it is never joined, so it may outlive the
+/// watcher briefly.
 #[derive(Debug)]
 pub struct PidWatcher {
     shared: Arc<Shared>,
@@ -51,6 +53,12 @@ impl std::fmt::Debug for Shared {
 
 impl PidWatcher {
     /// Start the dedicated kqueue thread.
+    ///
+    /// The thread is detached and not joined. If it dies (a kqueue error it
+    /// cannot recover from) it drops its sender, so the exit channel closes
+    /// while the watcher is still alive: the receiver seeing `None` before
+    /// the watcher is dropped means no further exits will ever be reported
+    /// and the caller must treat it as fatal.
     ///
     /// # Errors
     /// Failure to create or arm the kqueue, or to spawn the thread.

@@ -89,3 +89,40 @@ fn prepare_refuses_symlinked_run() {
     let err = prepare_dirs(&p).unwrap_err();
     assert!(matches!(err, PathError::NotDirectory(_)), "{err}");
 }
+
+#[test]
+fn prepare_refuses_world_writable_non_sticky_ancestor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("shared");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let p = resolve_paths_from(Some(&parent.join("state"))).unwrap();
+    let err = prepare_dirs(&p).unwrap_err();
+    assert!(matches!(err, PathError::UnsafeAncestor { .. }), "{err}");
+    assert!(
+        !p.state.exists(),
+        "nothing is created under an unsafe parent"
+    );
+}
+
+#[test]
+fn prepare_refuses_unsafe_grandparent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let top = tmp.path().join("top");
+    fs::create_dir(&top).unwrap();
+    fs::set_permissions(&top, fs::Permissions::from_mode(0o777)).unwrap();
+    let p = resolve_paths_from(Some(&top.join("a").join("state"))).unwrap();
+    let err = prepare_dirs(&p).unwrap_err();
+    assert!(matches!(err, PathError::UnsafeAncestor { .. }), "{err}");
+}
+
+#[test]
+fn prepare_accepts_sticky_world_writable_ancestor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("shared");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o1777)).unwrap();
+    let p = resolve_paths_from(Some(&parent.join("state"))).unwrap();
+    prepare_dirs(&p).unwrap();
+    assert_eq!(mode(&p.state), 0o700);
+}

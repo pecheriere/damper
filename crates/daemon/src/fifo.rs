@@ -14,7 +14,8 @@ use nix::errno::Errno;
 use nix::libc;
 use nix::sys::signal::kill;
 use nix::sys::stat::Mode;
-use nix::unistd::{Pid, mkfifo};
+use nix::unistd::{Pid, Uid, mkfifo};
+use rustix::fs::{FileType, Mode as RawMode, fchmod, fstat};
 
 /// The byte written as one token.
 const TOKEN: u8 = b'+';
@@ -37,6 +38,26 @@ fn open(path: &Path, read: bool) -> io::Result<File> {
         .write(!read)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
+}
+
+/// Fail unless `file` is a FIFO owned by the current user with mode 0600.
+fn verify_own_fifo(file: &File) -> io::Result<()> {
+    let st = fstat(file)?;
+    let kind = FileType::from_raw_mode(st.st_mode);
+    if kind != FileType::Fifo
+        || st.st_uid != Uid::current().as_raw()
+        || u32::from(st.st_mode) & 0o7777 != 0o600
+    {
+        return Err(io::Error::other(
+            "session FIFO is not a private FIFO owned by this user",
+        ));
+    }
+    Ok(())
+}
+
+/// A byte count that came from a read or write bounded by `CHUNK`.
+fn count(k: usize) -> io::Result<u32> {
+    u32::try_from(k).map_err(|_| io::Error::other("transfer larger than its buffer"))
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -62,14 +83,27 @@ impl SessionFifo {
         }
         let path = run_dir.join(format!("s-{shim_pid}-{}.fifo", session.0));
         mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(io::Error::from)?;
-        match (open(&path, true), open(&path, false)) {
-            (Ok(ro), Ok(rw)) => Ok(Self { path, rw, ro }),
-            (Err(e), _) | (_, Err(e)) => {
-                // Best effort: the open error is the one worth reporting.
+        match Self::open_both(&path) {
+            Ok((ro, rw)) => Ok(Self { path, rw, ro }),
+            Err(e) => {
+                // Best effort: the original error is the one worth reporting.
                 let _ = fs::remove_file(&path);
                 Err(e)
             }
         }
+    }
+
+    /// Open the read side, pin its mode to exactly 0600 and confirm it is our
+    /// FIFO, then open the write side. The mode set by `mkfifo` depends on the
+    /// umask (a strict one would even deny the write-side open), so the
+    /// `fchmod` on the descriptor comes between the two opens.
+    fn open_both(path: &Path) -> io::Result<(File, File)> {
+        let ro = open(path, true)?;
+        fchmod(&ro, RawMode::from_raw_mode(0o600))?;
+        verify_own_fifo(&ro)?;
+        let rw = open(path, false)?;
+        verify_own_fifo(&rw)?;
+        Ok((ro, rw))
     }
 
     /// The FIFO's path.
@@ -89,7 +123,11 @@ impl SessionFifo {
 
     /// Write up to `n` tokens; a full pipe stops the write early.
     ///
-    /// Returns the number actually written.
+    /// Returns the number actually written. Writes of at most `PIPE_BUF`
+    /// bytes are atomic on macOS: a pipe with less room than the request
+    /// fails the whole write with `EAGAIN` instead of storing part of it, so
+    /// the count is conservative (tokens that would have fit are not written)
+    /// but always exact.
     ///
     /// # Errors
     /// Any write error other than `WouldBlock` / `Interrupted`.
@@ -101,7 +139,7 @@ impl SessionFifo {
             let want = usize::try_from(n - written).map_or(CHUNK, |r| r.min(CHUNK));
             match w.write(&buf[..want]) {
                 Ok(0) => break,
-                Ok(k) => written += u32::try_from(k).unwrap_or(0),
+                Ok(k) => written += count(k)?,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -124,7 +162,7 @@ impl SessionFifo {
             let want = usize::try_from(n - read).map_or(CHUNK, |rest| rest.min(CHUNK));
             match r.read(&mut buf[..want]) {
                 Ok(0) => break,
-                Ok(k) => read += u32::try_from(k).unwrap_or(0),
+                Ok(k) => read += count(k)?,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -165,28 +203,48 @@ fn pid_is_dead(pid: u32) -> bool {
     matches!(kill(Pid::from_raw(raw), None), Err(Errno::ESRCH))
 }
 
+/// What [`sweep_stale_fifos`] did.
+#[derive(Debug, Default)]
+pub struct SweepReport {
+    /// FIFOs that were removed.
+    pub removed: Vec<PathBuf>,
+    /// Stale FIFOs (or directory entries that could not be read) that were
+    /// not removed, with the reason. The caller should log these.
+    pub failed: Vec<(PathBuf, io::Error)>,
+}
+
 /// Remove the FIFOs in `run_dir` left behind by dead shims.
 ///
 /// Only FIFOs named `s-<pid>-<id>.fifo` whose pid no longer exists are
-/// touched. Returns the removed paths.
+/// touched. Entries that vanish between listing and removal are not failures.
 ///
 /// # Errors
-/// Failure to read the directory. Entries that vanish or cannot be removed
-/// are skipped.
-pub fn sweep_stale_fifos(run_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut removed = Vec::new();
+/// Failure to read the directory. Per-entry failures go in the report.
+pub fn sweep_stale_fifos(run_dir: &Path) -> io::Result<SweepReport> {
+    let mut report = SweepReport::default();
     for entry in fs::read_dir(run_dir)? {
-        let Ok(entry) = entry else { continue };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                report.failed.push((run_dir.to_path_buf(), e));
+                continue;
+            }
+        };
         let path = entry.path();
         let Some(pid) = shim_pid_of(&path) else {
             continue;
         };
         let is_fifo = fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_fifo());
-        if is_fifo && pid_is_dead(pid) && fs::remove_file(&path).is_ok() {
-            removed.push(path);
+        if !is_fifo || !pid_is_dead(pid) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => report.removed.push(path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => report.failed.push((path, e)),
         }
     }
-    Ok(removed)
+    Ok(report)
 }
 
 #[cfg(test)]
