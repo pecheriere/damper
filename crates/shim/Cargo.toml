@@ -13,7 +13,8 @@ workspace = true
 [dependencies]
 damper-core = { version = "0.1.0", path = "../core" }
 damper-proto = { version = "0.1.0", path = "../proto" }
-nix = { version = "0.31.3", features = ["signal", "fs"] }
+libproc = "0.15.0"
+nix = { version = "0.31.3", features = ["signal", "fs", "event", "process", "term"] }
 serde_json = "1.0.154"
 signal-hook = "0.4.6"
 

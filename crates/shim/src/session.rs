@@ -157,7 +157,7 @@ impl Hold {
         let now = Instant::now();
         if now >= self.next_notice {
             say(out, &hold_line(self.reason, now - self.since, session));
-            self.next_notice += HOLD_NOTICE;
+            self.next_notice = now + HOLD_NOTICE;
         }
     }
 }
@@ -285,6 +285,23 @@ mod tests {
         let mut again = Vec::new();
         hold.notice_if_due(&mut again, &SessionId("s1".to_owned()));
         assert!(again.is_empty(), "not due yet");
+    }
+
+    #[test]
+    fn hold_notice_after_a_stop_does_not_burst() {
+        // As after Ctrl-Z: the process was stopped for several notice periods.
+        let now = Instant::now();
+        let mut hold = Hold {
+            reason: HoldReason::MemoryNearlyFull,
+            since: now.checked_sub(Duration::from_secs(150)).unwrap(),
+            next_notice: now.checked_sub(Duration::from_secs(120)).unwrap(),
+        };
+        let mut first = Vec::new();
+        hold.notice_if_due(&mut first, &SessionId("s1".to_owned()));
+        assert!(!first.is_empty(), "the first notice is due");
+        let mut again = Vec::new();
+        hold.notice_if_due(&mut again, &SessionId("s1".to_owned()));
+        assert!(again.is_empty(), "one line, not one per missed period");
     }
 
     #[test]

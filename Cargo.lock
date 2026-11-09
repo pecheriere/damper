@@ -206,6 +206,7 @@ version = "0.1.0"
 dependencies = [
  "damper-core",
  "damper-proto",
+ "libproc",
  "nix",
  "serde_json",
  "signal-hook",

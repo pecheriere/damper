@@ -7,9 +7,11 @@
 mod decide;
 mod fallback;
 mod hold;
+mod ignored;
 mod launch;
 mod resolve;
 mod session;
+mod signals;
 mod supervise;
 
 use damper_core::classify::{Invocation, ThreadEnv, classify};

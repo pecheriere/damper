@@ -4,7 +4,7 @@
 use damper_proto::paths::Paths;
 use damper_proto::{Event, EventKind};
 use nix::fcntl::OFlag;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::Path;
@@ -15,24 +15,43 @@ const TOKEN: u8 = b'+';
 /// The shim's fallback log, under `Paths::log`.
 const FALLBACKS: &str = "fallbacks.jsonl";
 
-/// Writes `tokens` jobserver tokens into the session FIFO.
+/// Opens the session FIFO the daemon named, read-write and non-blocking.
 ///
-/// The FIFO is opened write-only and non-blocking: with no reader the open
-/// fails (`ENXIO`) rather than hanging, and a full pipe fails rather than
-/// blocking. Callers ignore the error: cargo keeps its implicit slot.
+/// The shim holds this descriptor until cargo exits and never reads from
+/// it: being a reader itself, it can still feed the FIFO if the daemon dies
+/// before cargo has opened it, where a write-only open would fail with
+/// `ENXIO`.
 ///
 /// # Errors
-/// The open or write error, or `InvalidInput` if `fifo` is not a FIFO.
-pub fn self_feed(fifo: &Path, tokens: u32) -> io::Result<()> {
-    let mut file = OpenOptions::new()
+/// `InvalidInput` if `fifo` is not directly inside `run` or is not a FIFO,
+/// or the open error (a symlink is refused).
+pub fn open_fifo(fifo: &Path, run: &Path) -> io::Result<File> {
+    if fifo.parent() != Some(run) || fifo.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "FIFO outside the runtime directory",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
         .write(true)
         .custom_flags((OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW).bits())
         .open(fifo)?;
     if !file.metadata()?.file_type().is_fifo() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a FIFO"));
     }
+    Ok(file)
+}
+
+/// Writes `tokens` jobserver tokens into the session FIFO opened by
+/// [`open_fifo`]. A full pipe fails rather than blocking; callers ignore
+/// the error, and cargo keeps its implicit slot.
+///
+/// # Errors
+/// The write error.
+pub fn self_feed(mut fifo: &File, tokens: u32) -> io::Result<()> {
     let count = usize::try_from(tokens).map_err(io::Error::other)?;
-    file.write_all(&vec![TOKEN; count])
+    fifo.write_all(&vec![TOKEN; count])
 }
 
 /// Appends one `ShimFallback` event to `<log>/fallbacks.jsonl`. Every error
@@ -70,7 +89,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "test")]
 mod tests {
-    use super::{record_fallback, self_feed};
+    use super::{open_fifo, record_fallback, self_feed};
     use damper_proto::paths::resolve_paths_from;
     use damper_proto::{Event, EventKind};
     use nix::sys::stat::Mode;
@@ -80,38 +99,67 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    /// A FIFO in a runtime directory, as the daemon would make it.
+    fn fifo_in(run: &Path) -> std::path::PathBuf {
+        let fifo = run.join("s.fifo");
+        mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+        fifo
+    }
+
     #[test]
     fn self_feed_writes_tokens() {
         let tmp = tempfile::tempdir().unwrap();
-        let fifo = tmp.path().join("s.fifo");
-        mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+        let fifo = fifo_in(tmp.path());
+        let held = open_fifo(&fifo, tmp.path()).unwrap();
         // The reader cargo would be: read-write so the open does not block.
         let mut reader = OpenOptions::new()
             .read(true)
             .write(true)
             .open(&fifo)
             .unwrap();
-        self_feed(&fifo, 3).unwrap();
+        self_feed(&held, 3).unwrap();
         let mut buf = [0u8; 3];
         reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"+++");
     }
 
     #[test]
-    fn self_feed_without_a_reader_fails_instead_of_blocking() {
+    fn self_feed_works_before_any_reader_opens_the_fifo() {
         let tmp = tempfile::tempdir().unwrap();
-        let fifo = tmp.path().join("s.fifo");
-        mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
-        assert!(self_feed(&fifo, 3).is_err());
+        let fifo = fifo_in(tmp.path());
+        let held = open_fifo(&fifo, tmp.path()).unwrap();
+        self_feed(&held, 2).unwrap();
+        let mut reader = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let mut buf = [0u8; 2];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"++");
     }
 
     #[test]
-    fn self_feed_refuses_a_regular_file() {
+    fn open_fifo_refuses_a_regular_file_or_a_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("plain");
         std::fs::write(&file, "").unwrap();
-        assert!(self_feed(&file, 3).is_err());
-        assert_eq!(std::fs::read(&file).unwrap(), b"");
+        assert!(open_fifo(&file, tmp.path()).is_err());
+        let fifo = fifo_in(tmp.path());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        assert!(open_fifo(&link, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn open_fifo_refuses_a_path_outside_the_runtime_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let fifo = fifo_in(tmp.path());
+        assert!(open_fifo(&fifo, &run).is_err());
+        assert!(open_fifo(&run.join("../s.fifo"), &run).is_err());
+        assert!(open_fifo(&run.join(".."), &run).is_err());
     }
 
     #[test]
