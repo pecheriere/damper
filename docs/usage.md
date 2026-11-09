@@ -73,8 +73,12 @@ The file is `~/.config/damper/config.toml`, with the home directory taken from
 the passwd database, not `$HOME`. When `DAMPER_STATE_DIR` is set (development
 and testing), the state and the config both live under it, and the file is
 `$DAMPER_STATE_DIR/config.toml`. The daemon reads it at start; restart it after
-a change. A bad key falls back to its default with one warning naming it; the
-other keys are kept. `damper config check` prints the effective values and the
+a change. A bad value falls back to its default with one warning naming the key;
+the other keys are kept. A file that is not valid TOML gives all defaults with one
+warning. Unknown keys are ignored with a warning. A `DAMPER_STATE_DIR` that
+contains whitespace (it can't go in `MAKEFLAGS`) or is too long for the socket
+path is refused by the daemon, and the shim falls back to plain cargo.
+`damper config check` prints the effective values and the
 warnings.
 
 | Key | Default | Meaning |
