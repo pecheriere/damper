@@ -10,9 +10,11 @@
 //!   one implicit job without a token, one more per token taken. While the
 //!   jobs run, a child process named `rustc` stays alive, so the daemon sees a
 //!   compiling session (ruling R6). With `--wait`, the jobs start only once
-//!   that file exists (the `rustc` child already runs while it waits). Every
-//!   token goes back to the FIFO before the process exits. With `--report`,
-//!   it writes the concurrency timeline there (see [`Timeline::render`]).
+//!   that file exists (the `rustc` child already runs while it waits), or
+//!   fake-cargo fails after [`WAIT_LIMIT`]. Every token goes back to the FIFO
+//!   before the process exits, on error paths too. With `--report`, it keeps
+//!   the concurrency timeline there, rewritten at each change so a test can
+//!   follow a running build (see [`Timeline::render`]).
 //!
 //! Invoked through a hard link named `rustc`, it is that child: it waits for its
 //! stdin to close, so it dies with its parent, even one killed by `SIGKILL`.
@@ -32,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -41,6 +43,9 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 const TOKEN_POLL_MS: u8 = 20;
 /// How often `--wait` checks for its file.
 const WAIT_POLL: Duration = Duration::from_millis(10);
+/// How long `--wait` waits for its file before giving up, so a test that
+/// never writes it can't leave fake-cargo running forever.
+const WAIT_LIMIT: Duration = Duration::from_secs(60);
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
@@ -112,22 +117,22 @@ impl Jobs {
         let rustc = spawn_rustc(invoked_as)?;
         let fifo = open_jobserver()?;
         if let Some(path) = &self.wait {
-            while !path.exists() {
-                thread::sleep(WAIT_POLL);
-            }
+            wait_for(path)?;
         }
-        let state = Arc::new(Mutex::new(State::new(self.count)));
+        let state = Arc::new(Mutex::new(State::new(self.count, self.report.clone())));
         let mut workers = vec![self.implicit_worker(&state)];
-        if let Some(fifo) = &fifo {
-            self.dispatch(fifo, &state, &mut workers)?;
-        }
+        // Whatever the dispatcher ran into, every job started is waited for,
+        // so each token it holds goes back to the FIFO before fake-cargo exits.
+        let dispatched = fifo
+            .as_ref()
+            .map_or(Ok(()), |fifo| self.dispatch(fifo, &state, &mut workers));
+        let mut outcome = dispatched;
         for w in workers {
-            w.join().map_err(|_| "a job thread panicked")??;
+            let joined = w.join().map_err(|_| "a job thread panicked".to_owned());
+            outcome = outcome.and(joined.and_then(|done| done));
         }
-        if let Some(path) = &self.report {
-            let text = lock(&state).timeline.render();
-            write_atomically(path, &text).map_err(|e| format!("writing the report: {e}"))?;
-        }
+        outcome?;
+        lock(&state).timeline.finish()?;
         stop_rustc(rustc)
     }
 
@@ -156,9 +161,13 @@ impl Jobs {
             let Some(token) = take_token(fifo)? else {
                 continue;
             };
-            let fifo = fifo
-                .try_clone()
-                .map_err(|e| format!("cloning the FIFO: {e}"))?;
+            let fifo = match fifo.try_clone() {
+                Ok(clone) => clone,
+                Err(e) => {
+                    give_back(fifo, token)?;
+                    return Err(format!("cloning the FIFO: {e}"));
+                }
+            };
             if !lock(state).claim() {
                 return give_back(&fifo, token);
             }
@@ -182,9 +191,14 @@ struct State {
 }
 
 impl State {
-    fn new(count: u32) -> Self {
-        let mut timeline = Timeline::default();
-        timeline.lines.push(format!("start {}", now_ms()));
+    fn new(count: u32, report: Option<PathBuf>) -> Self {
+        let mut timeline = Timeline {
+            lines: Vec::new(),
+            peak: 0,
+            report,
+            error: None,
+        };
+        timeline.push(format!("start {}", now_ms()));
         Self {
             unclaimed: count,
             running: 0,
@@ -201,7 +215,7 @@ impl State {
         self.running += 1;
         self.timeline.concurrency(self.running);
         if self.unclaimed == 0 {
-            self.timeline.lines.push(format!("claimed {}", now_ms()));
+            self.timeline.push(format!("claimed {}", now_ms()));
         }
         true
     }
@@ -213,24 +227,52 @@ impl State {
 }
 
 /// The report: one event per line, times in milliseconds since the epoch.
-#[derive(Default)]
 struct Timeline {
     lines: Vec<String>,
     peak: u32,
+    /// Where `--report` keeps the timeline, if anywhere.
+    report: Option<PathBuf>,
+    /// The first failure to write the report, returned by [`Self::finish`].
+    error: Option<String>,
 }
 
 impl Timeline {
     fn concurrency(&mut self, running: u32) {
         self.peak = self.peak.max(running);
-        self.lines.push(format!("c {} {running}", now_ms()));
+        self.push(format!("c {} {running}", now_ms()));
+    }
+
+    /// Adds an event and rewrites the report with it.
+    fn push(&mut self, line: String) {
+        self.lines.push(line);
+        self.write(None);
+    }
+
+    /// Writes the final report, with its `end` line.
+    fn finish(&mut self) -> Result<(), String> {
+        self.write(Some(now_ms()));
+        self.error.take().map_or(Ok(()), Err)
+    }
+
+    fn write(&mut self, end: Option<u128>) {
+        let Some(path) = &self.report else {
+            return;
+        };
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(e) = write_atomically(path, &self.render(end)) {
+            self.error = Some(format!("writing the report: {e}"));
+        }
     }
 
     /// `start <t>` when the jobs start, `c <t> <n>` at each change in the
     /// number of running jobs, `claimed <t>` once every job is claimed, then
-    /// `peak <n>` and `end <t>`.
-    fn render(&self) -> String {
+    /// `peak <n>` so far and, once every job is done, `end <t>`.
+    fn render(&self, end: Option<u128>) -> String {
         let lines = self.lines.join("\n");
-        format!("{lines}\npeak {}\nend {}\n", self.peak, now_ms())
+        let end = end.map(|t| format!("end {t}\n")).unwrap_or_default();
+        format!("{lines}\npeak {}\n{end}", self.peak)
     }
 }
 
@@ -257,6 +299,18 @@ fn spawn_rustc(invoked_as: &Path) -> Result<Child, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("starting {}: {e}", link.display()))
+}
+
+/// Waits for `path` to exist, for at most [`WAIT_LIMIT`].
+fn wait_for(path: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            return Err(format!("{} never appeared", path.display()));
+        }
+        thread::sleep(WAIT_POLL);
+    }
+    Ok(())
 }
 
 fn stop_rustc(mut rustc: Child) -> Result<(), String> {

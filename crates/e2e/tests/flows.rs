@@ -17,34 +17,24 @@ fn build_gets_tokens_and_returns_them() {
         report.to_str().unwrap(),
     ]);
     let session = env.session_of(build.pid());
+    let fifo = env.tap_fifo();
     assert_eq!(build.wait().code(), Some(0));
-    let closed = env.wait_closed(&session);
-    let EventKind::SessionClosed {
-        tokens_recovered, ..
-    } = closed.kind
-    else {
-        unreachable!()
-    };
-    // The daemon logs each change of the session's token target and feeds
-    // up to it; drains only follow a lower target. So the last target logged
-    // is what the session held when it closed.
-    let targets: Vec<u32> = env
-        .events()
-        .into_iter()
-        .filter_map(|e| match e.kind {
-            EventKind::SessionTokens { session: s, tokens } if s == session => Some(tokens),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        targets.iter().any(|t| *t > 0),
-        "no token was fed: {targets:?}"
-    );
-    assert_eq!(Some(&tokens_recovered), targets.last(), "{targets:?}");
-    assert!(
-        Report::read(&report).peak >= 2,
-        "the build never ran a job on a token"
-    );
+    let tokens_recovered = env.tokens_recovered(&session);
+    // Every token in circulation was written to the FIFO by the daemon, and
+    // the daemon counts it as given until it drains it back out; cargo has
+    // returned all it took. So whatever targets the daemon set and however
+    // often it fed and drained, the tokens left in the FIFO are exactly the
+    // ones it still counted as given when the session closed.
+    assert!(!fifo.path.exists(), "the FIFO outlived its session");
+    assert_eq!(tokens_recovered, fifo.tokens());
+    let targets = env.targets(&session);
+    let most = targets.iter().copied().max().unwrap_or(0);
+    // The daemon never gives more than a target it set; cargo can't hold
+    // more than it was given.
+    assert!(tokens_recovered <= most, "{tokens_recovered} > {targets:?}");
+    let peak = Report::read(&report).peak;
+    assert!(peak >= 2, "the build never ran a job on a token");
+    assert!(peak - 1 <= most, "ran {peak} jobs with targets {targets:?}");
 }
 
 #[test]
@@ -70,20 +60,24 @@ fn two_builds_share_fairly() {
         .collect();
     let sessions: Vec<SessionId> = builds.iter().map(|b| env.session_of(b.pid())).collect();
     // Start the jobs together, once the daemon has settled on a split: both
-    // compiling, holding token counts at most one apart.
-    wait_until("both sessions to compile with a settled split", || {
+    // compiling, each with two slots at least (a token on top of its implicit
+    // slot), their slots at most one apart. (Status's `tokens_outstanding`
+    // counts only tokens cargo took, none before the barrier.)
+    wait_until("both sessions to compile, each with a token", || {
         let status = env.status();
-        let given: Vec<u32> = sessions
+        let slots: Vec<u32> = sessions
             .iter()
             .filter_map(|id| {
                 status
                     .sessions
                     .iter()
                     .find(|s| &s.session == id && s.state == damper_proto::SessionState::Compiling)
-                    .map(|s| s.tokens_outstanding)
+                    .map(|s| s.slots)
             })
             .collect();
-        (given.len() == 2 && given[0].abs_diff(given[1]) <= 1).then_some(())
+        let settled =
+            slots.len() == 2 && slots.iter().all(|n| *n >= 2) && slots[0].abs_diff(slots[1]) <= 1;
+        settled.then_some(())
     });
     std::fs::write(&barrier, b"").unwrap();
     for b in &mut builds {

@@ -296,6 +296,7 @@ version = "0.1.0"
 dependencies = [
  "damper-proto",
  "nix",
+ "rustix",
  "serde_json",
  "tempfile",
 ]

@@ -17,8 +17,8 @@ use damper_proto::{Event, EventKind, SessionId, SessionState, Status};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use std::ffi::OsString;
-use std::fs;
-use std::os::unix::fs::{DirBuilderExt, symlink};
+use std::fs::{self, File, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -99,17 +99,25 @@ impl Env {
         self.state.join("run")
     }
 
+    /// Writes the daemon's config file.
+    pub fn config(&self, text: &str) {
+        fs::write(self.state.join("config.toml"), text).unwrap();
+    }
+
     /// Starts `damperd` and waits until `damper status` answers.
+    ///
+    /// The daemon stays in the test's process group, so a runner that kills
+    /// the group (nextest on a timeout) takes it too; [`Daemon`]'s drop kills
+    /// it otherwise.
     pub fn start_daemon(&mut self) {
         assert!(self.daemon.is_none(), "a daemon is already running");
-        let log = fs::File::create(self.file("damperd.err")).unwrap();
+        let log = File::create(self.file("damperd.err")).unwrap();
         let child = Command::new(workspace_bin("damperd"))
             .env_clear()
             .env("DAMPER_STATE_DIR", &self.state)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
-            .process_group(0)
             .spawn()
             .unwrap();
         self.daemon = Some(Daemon(child));
@@ -135,15 +143,11 @@ impl Env {
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(fs::File::create(&stderr).unwrap())
+            .stderr(File::create(&stderr).unwrap())
             .process_group(0)
             .spawn()
             .unwrap();
-        Build {
-            child,
-            stderr,
-            started: Instant::now(),
-        }
+        Build { child, stderr }
     }
 
     fn damper(&self, args: &[&str]) -> Option<String> {
@@ -224,6 +228,38 @@ impl Env {
         })
     }
 
+    /// Opens the session's FIFO, the only one in the runtime dir, once the
+    /// daemon has made it.
+    pub fn tap_fifo(&self) -> FifoTap {
+        let path = wait_until("the session FIFO", || {
+            let fifos = self.fifos();
+            assert!(fifos.len() <= 1, "{fifos:?}");
+            fifos.into_iter().next()
+        });
+        FifoTap::open(&path)
+    }
+
+    /// Waits for `session` to close and returns its `tokens_recovered`.
+    pub fn tokens_recovered(&self, session: &SessionId) -> u32 {
+        match self.wait_closed(session).kind {
+            EventKind::SessionClosed {
+                tokens_recovered, ..
+            } => tokens_recovered,
+            other => panic!("not a SessionClosed: {other:?}"),
+        }
+    }
+
+    /// Every token target the daemon logged for `session`, in order.
+    pub fn targets(&self, session: &SessionId) -> Vec<u32> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::SessionTokens { session: s, tokens } if &s == session => Some(tokens),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The session FIFOs in the runtime dir.
     pub fn fifos(&self) -> Vec<PathBuf> {
         fs::read_dir(self.run_dir())
@@ -248,7 +284,6 @@ impl Drop for Daemon {
 pub struct Build {
     child: Child,
     stderr: PathBuf,
-    pub started: Instant,
 }
 
 impl Build {
@@ -301,20 +336,70 @@ pub fn alive(pid: u32) -> bool {
     kill(Pid::from_raw(i32::try_from(pid).unwrap()), None).is_ok()
 }
 
+/// A session FIFO held open by the test, to count the tokens in it without
+/// taking any. Holding it keeps the FIFO's buffer, and so its tokens, after
+/// the daemon has unlinked it and every other process has closed it.
+pub struct FifoTap {
+    /// `FIONREAD` counts a macOS FIFO's bytes only through a read-only end.
+    read_end: File,
+    /// A write end, so the buffer outlives every other writer; never used.
+    _write_end: File,
+    pub path: PathBuf,
+}
+
+impl FifoTap {
+    fn open(path: &Path) -> Self {
+        let open = |write: bool| {
+            OpenOptions::new()
+                .read(true)
+                .write(write)
+                .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+                .open(path)
+                .unwrap()
+        };
+        Self {
+            read_end: open(false),
+            _write_end: open(true),
+            path: path.to_owned(),
+        }
+    }
+
+    /// The tokens in the FIFO now.
+    pub fn tokens(&self) -> u32 {
+        u32::try_from(rustix::io::ioctl_fionread(&self.read_end).unwrap()).unwrap()
+    }
+}
+
 /// A `fake-cargo --report`: see its module docs for the format.
 pub struct Report {
     pub start: u64,
     /// `(time, running jobs)` at each change.
     pub series: Vec<(u64, u32)>,
+    /// When every job was claimed; 0 until then.
     pub claimed: u64,
     pub peak: u32,
+    /// When every job was done; 0 until then.
     pub end: u64,
 }
 
 impl Report {
-    /// Waits for the report at `path` and parses it.
+    /// Waits for the finished report at `path` and parses it.
     pub fn read(path: &Path) -> Self {
-        let text = wait_until("the report", || fs::read_to_string(path).ok());
+        wait_until("the report", || Self::current(path).filter(|r| r.end > 0))
+    }
+
+    /// Waits until the build at `path` runs at least `jobs` jobs at once.
+    pub fn wait_running(path: &Path, jobs: u32) {
+        wait_until("the build to run its jobs", || {
+            Self::current(path)
+                .and_then(|r| r.series.last().copied())
+                .filter(|(_, n)| *n >= jobs)
+        });
+    }
+
+    /// The report as it stands, if fake-cargo has written one yet.
+    pub fn current(path: &Path) -> Option<Self> {
+        let text = fs::read_to_string(path).ok()?;
         let mut r = Report {
             start: 0,
             series: Vec::new(),
@@ -334,7 +419,7 @@ impl Report {
                 other => panic!("unknown report line {other}"),
             }
         }
-        r
+        Some(r)
     }
 
     /// The most jobs running at once between `from` and `to` (inclusive),
