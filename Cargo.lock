@@ -293,6 +293,12 @@ dependencies = [
 [[package]]
 name = "damper-e2e"
 version = "0.1.0"
+dependencies = [
+ "damper-proto",
+ "nix",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "damper-proto"
