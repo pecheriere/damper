@@ -171,26 +171,31 @@ fn describe(kind: &EventKind) -> String {
             shim_pid,
             never_hold,
         } => format!(
-            "session {session} opened: {} in {} (shim pid {shim_pid}){}",
+            "session {} opened: {} in {} (shim pid {shim_pid}){}",
+            clean(&session.0),
             clean(subcommand),
             clean_path(cwd),
             if *never_hold { ", never held" } else { "" },
         ),
         EventKind::SessionStarted { session, cargo_pid } => {
-            format!("session {session} started cargo (pid {cargo_pid})")
+            format!(
+                "session {} started cargo (pid {cargo_pid})",
+                clean(&session.0)
+            )
         }
         EventKind::SessionTokens { session, tokens } => {
-            format!("session {session} now holds {tokens} tokens")
+            format!("session {} now holds {tokens} tokens", clean(&session.0))
         }
         EventKind::HoldStarted { session, reason } => {
-            format!("session {session} held: {reason}")
+            format!("session {} held: {reason}", clean(&session.0))
         }
         EventKind::HoldReleased {
             session,
             waited_ms,
             timed_out,
         } => format!(
-            "session {session} released after {}{}",
+            "session {} released after {}{}",
+            clean(&session.0),
             fmt_secs(waited_ms / 1000),
             if *timed_out {
                 " (waited the maximum and ran anyway)"
@@ -203,7 +208,8 @@ fn describe(kind: &EventKind) -> String {
             tokens_recovered,
             duration_ms,
         } => format!(
-            "session {session} closed after {}, recovered {tokens_recovered} tokens",
+            "session {} closed after {}, recovered {tokens_recovered} tokens",
+            clean(&session.0),
             fmt_secs(duration_ms / 1000),
         ),
         EventKind::ShimFallback { reason, cwd } => format!(

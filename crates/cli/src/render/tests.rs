@@ -254,3 +254,43 @@ fn clean_replaces_control_and_format_characters() {
     }
     assert_eq!(super::clean("plain é 日本"), "plain é 日本");
 }
+
+#[test]
+fn session_ids_are_cleaned_in_every_event() {
+    let s = sid("x\u{1b}[31m");
+    let kinds = [
+        EventKind::SessionOpened {
+            session: s.clone(),
+            cwd: "/w".into(),
+            subcommand: "build".into(),
+            shim_pid: 1,
+            never_hold: false,
+        },
+        EventKind::SessionStarted {
+            session: s.clone(),
+            cargo_pid: 2,
+        },
+        EventKind::SessionTokens {
+            session: s.clone(),
+            tokens: 3,
+        },
+        EventKind::HoldStarted {
+            session: s.clone(),
+            reason: HoldReason::PressureCritical,
+        },
+        EventKind::HoldReleased {
+            session: s.clone(),
+            waited_ms: 1000,
+            timed_out: false,
+        },
+        EventKind::SessionClosed {
+            session: s.clone(),
+            tokens_recovered: 0,
+            duration_ms: 1000,
+        },
+    ];
+    let events: Vec<Event> = kinds.into_iter().map(|k| ev(NOW, k)).collect();
+    let out = render_events(&events, NOW, false);
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+    assert_eq!(out.matches("x?[31m").count(), events.len(), "{out}");
+}
