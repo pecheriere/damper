@@ -111,8 +111,8 @@ Measurement pitfalls that would give a wrong answer:
   - the key numbers;
   - the exact commands;
   - what it changes in the design, if anything.
+  - At the end, a list of design changes for the owner to rule on. If S2 refuted the design, that list leads.
 
-  End with a list of design changes for the owner to rule on. If S2 refuted the design, that list leads.
 - [ ] **Step 2:** Delete the spike SSD build dirs. Find them by the workspace paths under `$S`. Confirm with `dust -d 1 "/Volumes/External SSD/cargo-build"` before and after.
 - [ ] **Step 3:** Commit.
 
