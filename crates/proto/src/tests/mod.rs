@@ -174,6 +174,79 @@ fn client_exchanges_messages_and_sees_eof() {
 }
 
 #[test]
+fn client_sees_eof_when_the_timeout_changes_after_the_peer_closed() {
+    let (_dir, listener, path) = socket_pair();
+    let mut client = Client::connect(&path, Duration::from_millis(200)).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.write_all(&encode(&ServerMsg::Heartbeat).unwrap())
+        .unwrap();
+    assert_eq!(client.recv(None).unwrap(), ServerMsg::Heartbeat);
+    drop(peer);
+    let err = client.recv(Some(Duration::from_millis(50))).unwrap_err();
+    assert!(matches!(err, ProtoError::Closed), "{err:?}");
+}
+
+#[test]
+fn client_delivers_buffered_data_when_the_timeout_changes_after_the_peer_closed() {
+    let (_dir, listener, path) = socket_pair();
+    let mut client = Client::connect(&path, Duration::from_millis(200)).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.write_all(&encode(&ServerMsg::Heartbeat).unwrap())
+        .unwrap();
+    assert_eq!(client.recv(None).unwrap(), ServerMsg::Heartbeat);
+    peer.write_all(&encode(&ServerMsg::Heartbeat).unwrap())
+        .unwrap();
+    drop(peer);
+    assert_eq!(
+        client.recv(Some(Duration::from_millis(50))).unwrap(),
+        ServerMsg::Heartbeat
+    );
+    let err = client.recv(Some(Duration::from_millis(50))).unwrap_err();
+    assert!(matches!(err, ProtoError::Closed), "{err:?}");
+}
+
+#[test]
+fn client_never_blocks_when_the_peer_shut_down_only_one_direction() {
+    let (_dir, listener, path) = socket_pair();
+    let mut client = Client::connect(&path, Duration::from_millis(200)).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    peer.write_all(&encode(&ServerMsg::Heartbeat).unwrap())
+        .unwrap();
+    assert_eq!(client.recv(None).unwrap(), ServerMsg::Heartbeat);
+    peer.shutdown(std::net::Shutdown::Read).unwrap();
+    let started = std::time::Instant::now();
+    let result = client.recv(Some(Duration::from_millis(50)));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        matches!(result, Err(ProtoError::Timeout | ProtoError::Io(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn recv_timeout_is_a_deadline_not_a_per_read_timeout() {
+    let (_dir, listener, path) = socket_pair();
+    let mut client = Client::connect(&path, Duration::from_millis(200)).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    let trickler = std::thread::spawn(move || {
+        for _ in 0..40 {
+            if peer.write_all(b"a").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        peer
+    });
+    let started = std::time::Instant::now();
+    let err = client.recv(Some(Duration::from_millis(150))).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, ProtoError::Timeout), "{err:?}");
+    assert!(elapsed < Duration::from_millis(600), "{elapsed:?}");
+    drop(client);
+    drop(trickler.join().unwrap());
+}
+
+#[test]
 fn client_keeps_a_partial_line_across_a_timeout() {
     let (_dir, listener, path) = socket_pair();
     let mut client = Client::connect(&path, Duration::from_millis(200)).unwrap();
@@ -207,6 +280,11 @@ fn client_rejects_an_endless_line() {
     });
     let err = client.recv(Some(Duration::from_secs(2))).unwrap_err();
     assert!(matches!(err, ProtoError::LineTooLong));
+    assert!(matches!(client.recv(None), Err(ProtoError::Io(_))));
+    assert!(matches!(
+        client.send(&ClientMsg::Status),
+        Err(ProtoError::Io(_))
+    ));
     drop(client);
     drop(writer.join().unwrap());
 }
