@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use damper_proto::{EventKind, ServerMsg, SessionId};
 
-use super::session::{Cargo, Session, State};
+use super::session::{Cargo, SelfFeed, Session, State};
 use super::{Action, Broker, OpenError, OpenRequest, millis};
 
 impl Broker {
@@ -113,14 +113,23 @@ impl Broker {
     /// The shim lost the daemon mid-build and fed its FIFO `tokens` itself
     /// (ruling R22): they count as given, so drains can take them back under
     /// pressure, the session is not hungry on top of them, and a close
-    /// recovers them. Logged as a `ShimFallback`. Unknown sessions are
-    /// ignored.
-    pub fn self_fed(&mut self, session: &SessionId, tokens: u32) -> Vec<Action> {
+    /// recovers them. A tick that already saw them in the FIFO adopted them;
+    /// only the rest is added now. The shim feeds at most the machine's
+    /// cores, so `tokens` is clamped to `max_tokens`, and only the first
+    /// report per session counts: a shim self-feeds once, so later reports
+    /// are ignored without a log line. Logged as a `ShimFallback`. Unknown
+    /// sessions are ignored.
+    pub fn self_fed(&mut self, session: &SessionId, tokens: u32, max_tokens: u32) -> Vec<Action> {
         let Some(index) = self.index(session) else {
             return Vec::new();
         };
         let s = &mut self.sessions[index];
-        s.given = s.given.saturating_add(tokens);
+        let SelfFeed::Unreported { adopted } = s.self_feed else {
+            return Vec::new();
+        };
+        s.self_feed = SelfFeed::Reported;
+        let tokens = tokens.min(max_tokens);
+        s.given = s.given.saturating_add(tokens.saturating_sub(adopted));
         vec![Action::Log(EventKind::ShimFallback {
             reason: format!(
                 "session {session}: the shim fed {tokens} tokens itself after losing the daemon; counted as given"

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use damper_proto::{EventKind, LimitReason, ServerMsg};
 
-use super::session::{Session, State};
+use super::session::{SelfFeed, Session, State};
 use super::{Action, Broker, TickInput, millis};
 use crate::account::{Accounting, Tracked, account};
 use crate::allocate::{Demand, allocate};
@@ -63,10 +63,16 @@ impl Broker {
         for (index, s) in self.sessions.iter_mut().enumerate() {
             s.fill = input.fifo_fill.get(&s.id).copied();
             // In normal operation fill ≤ given. Anything above is foreign
-            // tokens (a shim's self-feed the daemon never heard of), adopted
-            // so drains and `tokens_recovered` cover them.
-            if let Some(fill) = s.fill {
-                s.given = s.given.max(fill);
+            // tokens (a shim's self-feed the daemon has not heard of yet),
+            // adopted so drains and `tokens_recovered` cover them, and
+            // remembered so the `SelfFed` that follows does not add them again.
+            if let Some(fill) = s.fill
+                && fill > s.given
+            {
+                if let SelfFeed::Unreported { adopted } = &mut s.self_feed {
+                    *adopted = adopted.saturating_add(fill - s.given);
+                }
+                s.given = fill;
             }
             s.compiling = false;
             s.test_jobs = 0;

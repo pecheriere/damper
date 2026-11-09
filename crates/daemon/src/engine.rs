@@ -275,7 +275,9 @@ impl Engine {
                 self.apply(actions);
             }
             Request::SelfFed { session, tokens } => {
-                let actions = self.broker.self_fed(&session, tokens);
+                // The shim feeds at most the machine's cores (less one).
+                let max = self.config.machine.cores;
+                let actions = self.broker.self_fed(&session, tokens, max);
                 self.apply(actions);
             }
             Request::Closed { session } => {

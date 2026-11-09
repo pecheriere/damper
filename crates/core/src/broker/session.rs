@@ -40,6 +40,8 @@ pub(super) struct Session {
     pub(super) connection_closed: bool,
     /// Tokens fed minus tokens drained.
     pub(super) given: u32,
+    /// Whether the shim reported a self-feed (ruling R22).
+    pub(super) self_feed: SelfFeed,
     /// The token target last computed; `SessionTokens` is logged when it moves.
     pub(super) target: u32,
     /// Tokens in the FIFO at the last tick; `None` when it could not be read.
@@ -55,6 +57,17 @@ pub(super) struct Session {
     pub(super) test_jobs: u32,
 }
 
+/// The shim's self-feed report for a session (ruling R22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SelfFeed {
+    /// No report yet. `adopted` counts the tokens ticks took into `given`
+    /// from a fill above it; the report adds only the rest, so a self-feed a
+    /// tick saw first is never counted twice.
+    Unreported { adopted: u32 },
+    /// Reported; a shim self-feeds once, so further reports are ignored.
+    Reported,
+}
+
 impl Session {
     pub(super) fn new(id: SessionId, req: OpenRequest, now: Instant) -> Self {
         Self {
@@ -65,6 +78,7 @@ impl Session {
             cargo: Cargo::NotStarted,
             connection_closed: false,
             given: 0,
+            self_feed: SelfFeed::Unreported { adopted: 0 },
             target: 0,
             fill: None,
             compiling: false,
