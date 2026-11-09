@@ -37,7 +37,10 @@ jobs:
 
   test:
     runs-on: macos-15
-    # Until the suite has been measured.
+    # The suite itself runs in about 16 s locally; the rest of the job is the
+    # cold build of the workspace and of cargo-nextest, which only the runner can
+    # measure. The e2e self-feed assertions need at least 3 cores, and GitHub's
+    # macOS arm64 runner has 3.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,8 +69,9 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/lint"
           "$RUNNER_TEMP/lint/bin/pip" install --quiet --require-hashes --only-binary :all: \
             -r .github/requirements-lint.txt
-          "$RUNNER_TEMP/lint/bin/ruff" check .github/scripts
-          "$RUNNER_TEMP/lint/bin/ruff" format --check .github/scripts
+          "$RUNNER_TEMP/lint/bin/ruff" check --config .github/ruff.toml .github/scripts scripts/acceptance
+          "$RUNNER_TEMP/lint/bin/ruff" format --check --config .github/ruff.toml .github/scripts scripts/acceptance
           python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
+          python3 -I -m unittest discover -s scripts/acceptance -p 'test_*.py'
       - name: Refuse crate versions published less than 7 days ago
         run: python3 -I .github/scripts/crate_age.py --base HEAD^1

@@ -1,4 +1,6 @@
 # A hung test fails instead of stalling the run: nextest has no limit by default.
-# These values stay until the suite has been measured.
+# Measured on 2026-11-09 (291 tests, 15.6 s in total): the slowest test,
+# flows::two_builds_share_fairly, takes 14.6 s. A test is killed after three
+# periods, 45 s, about three times the slowest.
 [profile.default]
-slow-timeout = { period = "10s", terminate-after = 3 }
+slow-timeout = { period = "15s", terminate-after = 3 }
