@@ -8,6 +8,9 @@ use libproc::bsd_info::BSDInfo;
 use libproc::pid_rusage::{RUsageInfoV4, pidrusage};
 use libproc::proc_pid::{self, pidinfo};
 use libproc::processes::{ProcFilter, pids_by_type};
+use nix::errno::Errno;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 
 use crate::sources::{ProcessSource, Snapshot};
 
@@ -94,6 +97,19 @@ pub fn process_name(pid: u32) -> Option<String> {
 pub fn parent_pid(pid: u32) -> Option<u32> {
     let bsd = pidinfo::<BSDInfo>(i32::try_from(pid).ok()?, 0).ok()?;
     Some(bsd.pbi_ppid)
+}
+
+/// Whether process `pid` no longer exists.
+///
+/// `kill(pid, 0)` sends nothing: `ESRCH` means the process is gone, while
+/// success or `EPERM` means it still exists. A pid that cannot be a process
+/// id counts as gone.
+#[must_use]
+pub fn pid_is_gone(pid: u32) -> bool {
+    match i32::try_from(pid) {
+        Ok(raw) if raw > 0 => kill(Pid::from_raw(raw), None) == Err(Errno::ESRCH),
+        _ => true,
+    }
 }
 
 #[cfg(test)]

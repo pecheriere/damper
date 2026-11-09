@@ -22,8 +22,16 @@ pub(crate) fn never_hold(shim_parent_name: Option<&str>) -> bool {
 /// Whether `Started { cargo_pid }` names the shim's own child: cargo's parent
 /// must be the shim. `taskpolicy` and `nice` exec into cargo, so they keep
 /// the pid the shim spawned and do not change this.
-pub(crate) fn started_allowed(cargo_ppid: Option<u32>, shim_pid: u32) -> bool {
-    cargo_ppid == Some(shim_pid)
+///
+/// A cargo that already exited and was reaped has no parent to read; if it
+/// is also gone (`cargo_gone`), the report is believable and is accepted so
+/// the session closes normally. An unreadable parent on a process that still
+/// exists belongs to someone else and is refused.
+pub(crate) fn started_allowed(cargo_ppid: Option<u32>, cargo_gone: bool, shim_pid: u32) -> bool {
+    match cargo_ppid {
+        Some(ppid) => ppid == shim_pid,
+        None => cargo_gone,
+    }
 }
 
 /// Why a line was refused, without echoing anything the client sent

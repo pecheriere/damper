@@ -21,7 +21,7 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::eventlog::EventLog;
-use crate::procs::{parent_pid, process_name};
+use crate::procs::{parent_pid, pid_is_gone, process_name};
 
 mod checks;
 mod wire;
@@ -269,9 +269,14 @@ impl Conn {
                     return Next::Close;
                 };
                 let session = session.clone();
-                // An open session means the peer pid was read and checked.
-                let shim_pid = self.peer_pid.unwrap_or_default();
-                if !started_allowed(parent_pid(cargo_pid), shim_pid) {
+                let Some(shim_pid) = self.peer_pid else {
+                    self.reject("the connecting process is unknown".to_owned())
+                        .await;
+                    return Next::Close;
+                };
+                let ppid = parent_pid(cargo_pid);
+                let gone = ppid.is_none() && pid_is_gone(cargo_pid);
+                if !started_allowed(ppid, gone, shim_pid) {
                     self.reject("cargo_pid is not a child of the shim".to_owned())
                         .await;
                     return Next::Close;

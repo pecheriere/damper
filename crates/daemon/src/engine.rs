@@ -23,6 +23,8 @@ use crate::server::{LogTx, Request};
 use crate::sources::{MemorySource, ProcessSource, Snapshot};
 
 mod liveness;
+#[cfg(test)]
+mod tests;
 
 /// The broker's sampling and policy interval.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -173,6 +175,10 @@ impl Engine {
             let actions = self.broker.reconfigure(loaded.effective, loaded.warnings);
             self.apply(actions);
         }
+        for pid in liveness::take_exited(&mut self.polled) {
+            let actions = self.broker.pid_exited(pid, Instant::now());
+            self.apply(actions);
+        }
         let snapshot = match samples.snapshot {
             Ok(snapshot) => {
                 self.procs_failing = false;
@@ -199,10 +205,6 @@ impl Engine {
                 return;
             }
         };
-        for pid in liveness::take_exited(&mut self.polled) {
-            let actions = self.broker.pid_exited(pid, Instant::now());
-            self.apply(actions);
-        }
         let fifo_fill = self.read_fills();
         let input = TickInput {
             now: Instant::now(),

@@ -194,3 +194,37 @@ async fn started_for_the_shims_child_is_watched_until_it_exits() {
     wait_until_gone(&fifo).await;
     d.stop().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn started_for_a_cargo_that_already_exited_closes_the_session_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(&dir);
+    let d = start(&p).await;
+    let mut conn = Conn::new(&p.socket).await;
+    let fifo = open_session(&mut conn).await;
+    // A short-lived cargo: finished and reaped before `Started` arrives.
+    let mut cargo = Command::new("/usr/bin/true").spawn().unwrap();
+    let pid = cargo.id();
+    cargo.wait().unwrap();
+    conn.send(&ClientMsg::Started { cargo_pid: pid }).await;
+    drop(conn);
+    wait_for_event(&p, |k| matches!(k, EventKind::SessionClosed { .. })).await;
+    wait_until_gone(&fifo).await;
+    let mut log = Conn::new(&p.socket).await;
+    log.send(&ClientMsg::Log {
+        since_ms: None,
+        session: None,
+    })
+    .await;
+    let Some(ServerMsg::Events { events, .. }) = log.recv().await else {
+        panic!("expected events");
+    };
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Error { .. })
+                || matches!(&e.kind, EventKind::ClientRejected { reason } if reason.contains("cargo_pid"))),
+        "{events:?}"
+    );
+    d.stop().await.unwrap();
+}

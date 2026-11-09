@@ -2,23 +2,16 @@
 
 use std::collections::HashSet;
 
-use nix::errno::Errno;
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
+use crate::procs::pid_is_gone;
 
 /// Removes from `pids` and returns those that no longer exist.
 ///
-/// `kill(pid, 0)` sends nothing: `ESRCH` means the process is gone, while
-/// success or `EPERM` means it still exists. A pid that cannot be a process
-/// id counts as gone.
+/// See [`pid_is_gone`] for what counts as gone.
 pub(crate) fn take_exited(pids: &mut HashSet<u32>) -> Vec<u32> {
     let exited: Vec<u32> = pids
         .iter()
         .copied()
-        .filter(|&pid| match i32::try_from(pid) {
-            Ok(raw) if raw > 0 => kill(Pid::from_raw(raw), None) == Err(Errno::ESRCH),
-            _ => true,
-        })
+        .filter(|&pid| pid_is_gone(pid))
         .collect();
     for pid in &exited {
         pids.remove(pid);

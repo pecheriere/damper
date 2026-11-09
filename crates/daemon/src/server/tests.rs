@@ -25,9 +25,13 @@ fn only_rust_analyzers_builds_are_never_held() {
 
 #[test]
 fn started_needs_cargo_to_be_the_shims_child() {
-    assert!(started_allowed(Some(4242), 4242));
-    assert!(!started_allowed(Some(1), 4242));
-    assert!(!started_allowed(None, 4242));
+    assert!(started_allowed(Some(4242), false, 4242));
+    assert!(started_allowed(Some(4242), true, 4242));
+    assert!(!started_allowed(Some(1), false, 4242));
+    // Unreadable and gone: cargo already exited and was reaped.
+    assert!(started_allowed(None, true, 4242));
+    // Unreadable but still alive (another user's process): not the shim's.
+    assert!(!started_allowed(None, false, 4242));
 }
 
 #[test]
