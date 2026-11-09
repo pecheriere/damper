@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod allocate;
+pub mod broker;
 pub mod classify;
 pub mod config;
 pub mod peak;
