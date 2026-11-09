@@ -11,9 +11,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+damper-core = { version = "0.1.0", path = "../core" }
 damper-proto = { version = "0.1.0", path = "../proto" }
+libproc = "0.15.0"
 nix = { version = "0.31.3", features = ["fs", "event", "signal", "user", "process"] }
 rustix = { version = "1.1.6", features = ["fs"] }
+sysctl = "0.7.1"
 tokio = { version = "1.54.1", features = ["sync"] }
 
 [dev-dependencies]
