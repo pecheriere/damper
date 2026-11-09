@@ -120,6 +120,7 @@ version = "0.1.0"
 name = "damper-core"
 version = "0.1.0"
 dependencies = [
+ "damper-proto",
  "proptest",
  "thiserror",
  "toml",

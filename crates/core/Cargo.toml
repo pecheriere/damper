@@ -11,6 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+damper-proto = { version = "0.1.0", path = "../proto" }
 thiserror = "2.0.21"
 toml = "1.2.1"
 
