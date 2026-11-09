@@ -10,6 +10,7 @@
 //! The daemon ticks once before it accepts connections, so these come first in
 //! the log.
 
+mod lifecycle;
 mod session;
 mod tick;
 
@@ -25,7 +26,7 @@ use crate::account::ProcInfo;
 use crate::classify::Kind;
 use crate::config::Effective;
 use crate::policy::Policy;
-use session::{Session, State};
+use session::Session;
 
 /// The most sessions open at once; further opens fail and the shim falls back.
 pub const MAX_SESSIONS: usize = 256;
@@ -86,14 +87,17 @@ pub enum Action {
         /// The shim's pid, part of the FIFO's name.
         shim_pid: u32,
     },
-    /// Write this many tokens into the session's FIFO.
+    /// Write this many tokens into the session's FIFO, then report how many
+    /// went in through [`Broker::feed_result`]: a full FIFO takes fewer.
     Feed {
         /// The session.
         session: SessionId,
         /// Tokens to write.
         tokens: u32,
     },
-    /// Read this many tokens back out of the session's FIFO.
+    /// Read this many tokens back out of the session's FIFO, then report how
+    /// many came out through [`Broker::drain_result`]: cargo may take some
+    /// first.
     Drain {
         /// The session.
         session: SessionId,
@@ -112,7 +116,9 @@ pub enum Action {
         /// The message.
         msg: ServerMsg,
     },
-    /// Report this pid's exit through [`Broker::pid_exited`].
+    /// Report this pid's exit through [`Broker::pid_exited`]. A pid that has
+    /// already exited (kqueue answers `ESRCH`) must be reported the same way,
+    /// at once, or its session never closes.
     WatchPid {
         /// The pid to watch.
         pid: u32,
@@ -181,142 +187,21 @@ impl Broker {
         }
     }
 
-    /// Registers a session and asks the daemon to create its FIFO.
-    ///
-    /// # Errors
-    ///
-    /// [`OpenError::TooManySessions`] when [`MAX_SESSIONS`] are open.
-    pub fn open(
-        &mut self,
-        now: Instant,
-        req: OpenRequest,
-    ) -> Result<(SessionId, Vec<Action>), OpenError> {
-        if self.sessions.len() >= MAX_SESSIONS {
-            return Err(OpenError::TooManySessions);
-        }
-        let id = SessionId(format!("{:x}-{}", self.start_unix_secs, self.next_id));
-        self.next_id = self.next_id.saturating_add(1);
-        let actions = vec![
-            Action::CreateFifo {
-                session: id.clone(),
-                shim_pid: req.shim_pid,
-            },
-            Action::Log(EventKind::SessionOpened {
-                session: id.clone(),
-                cwd: req.cwd.clone(),
-                subcommand: req.subcommand.clone(),
-                shim_pid: req.shim_pid,
-                never_hold: req.never_hold,
-            }),
-        ];
-        self.sessions.push(Session::new(id.clone(), req, now));
-        Ok((id, actions))
-    }
-
-    /// The session's FIFO exists: sends `Opened`, then `Granted` or `Held`.
-    ///
-    /// A session is held only while the last decision holds, and never when it
-    /// is nested or `never_hold`.
-    pub fn fifo_ready(&mut self, session: &SessionId, path: PathBuf, now: Instant) -> Vec<Action> {
-        let hold = self.hold;
-        let threads = self.share_for_new();
-        let Some(index) = self.index(session) else {
-            return Vec::new();
-        };
-        let s = &mut self.sessions[index];
-        if s.state != State::Pending {
-            return Vec::new();
-        }
-        let mut actions = vec![Action::Send {
-            session: session.clone(),
-            msg: ServerMsg::Opened {
-                session: session.clone(),
-                fifo: path,
-            },
-        }];
-        if let Some(reason) = hold.filter(|_| !s.req.nested && !s.req.never_hold) {
-            s.state = State::Held { since: now, reason };
-            actions.push(Action::Send {
-                session: session.clone(),
-                msg: ServerMsg::Held { reason },
-            });
-            actions.push(Action::Log(EventKind::HoldStarted {
-                session: session.clone(),
-                reason,
-            }));
-        } else {
-            s.state = State::Granted;
-            actions.push(Action::Send {
-                session: session.clone(),
-                msg: ServerMsg::Granted {
-                    threads,
-                    after_timeout: false,
-                },
-            });
-        }
-        actions
-    }
-
-    /// Cargo is running as `cargo_pid`: watch it, so the session outlives
-    /// its connection until cargo exits. Ignored after the first call.
-    pub fn started(&mut self, session: &SessionId, cargo_pid: u32) -> Vec<Action> {
-        let Some(index) = self.index(session) else {
-            return Vec::new();
-        };
-        let s = &mut self.sessions[index];
-        if s.cargo_pid.is_some() {
-            return Vec::new();
-        }
-        s.cargo_pid = Some(cargo_pid);
-        vec![
-            Action::WatchPid { pid: cargo_pid },
-            Action::Log(EventKind::SessionStarted {
-                session: session.clone(),
-                cargo_pid,
-            }),
-        ]
-    }
-
-    /// The shim's connection closed. The session closes now unless cargo
-    /// started and is still running.
-    pub fn connection_closed(&mut self, session: &SessionId, now: Instant) -> Vec<Action> {
-        let Some(index) = self.index(session) else {
-            return Vec::new();
-        };
-        self.sessions[index].connection_closed = true;
-        self.close_if_done(index, now)
-    }
-
-    /// A watched pid exited: closes every session whose cargo it was and whose
-    /// connection is already closed.
-    pub fn pid_exited(&mut self, pid: u32, now: Instant) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let mut index = 0;
-        while index < self.sessions.len() {
-            let s = &mut self.sessions[index];
-            if s.cargo_pid == Some(pid) && !s.cargo_exited {
-                s.cargo_exited = true;
-                let closed = self.close_if_done(index, now);
-                if !closed.is_empty() {
-                    actions.extend(closed);
-                    continue;
-                }
-            }
-            index += 1;
-        }
-        actions
-    }
-
     /// Applies a new configuration: logs `ConfigLoaded`, and `LimitChanged`
     /// with reason `Config` when the limit moved.
+    ///
+    /// Before the first tick, the start-up `ConfigLoaded` is dropped as stale
+    /// and no `LimitChanged` is logged: the first tick's `Startup` change
+    /// reports the configured limit.
     pub fn reconfigure(&mut self, cfg: Effective, warnings: Vec<String>) -> Vec<Action> {
         let from = self.policy.limit();
         self.policy.reconfigure(&cfg);
         self.cfg = cfg;
         self.warnings.clone_from(&warnings);
+        self.startup.clear();
         let mut actions = vec![Action::Log(EventKind::ConfigLoaded { warnings })];
         let to = self.policy.limit();
-        if to != from {
+        if to != from && self.ticks > 0 {
             self.reason = LimitReason::Config;
             actions.push(Action::Log(EventKind::LimitChanged {
                 from,
@@ -343,29 +228,28 @@ impl Broker {
         }
     }
 
-    fn index(&self, session: &SessionId) -> Option<usize> {
-        self.sessions.iter().position(|s| &s.id == session)
+    /// The daemon wrote `actual` of the `requested` tokens of a
+    /// [`Action::Feed`]; the shortfall was never given. Unknown sessions are
+    /// ignored.
+    pub fn feed_result(&mut self, session: &SessionId, requested: u32, actual: u32) {
+        if let Some(index) = self.index(session) {
+            let s = &mut self.sessions[index];
+            s.given = s.given.saturating_sub(requested.saturating_sub(actual));
+        }
     }
 
-    /// Closes session `index` if its connection is closed and its cargo, if
-    /// any, has exited; returns the actions, empty if it stays open.
-    fn close_if_done(&mut self, index: usize, now: Instant) -> Vec<Action> {
-        let s = &self.sessions[index];
-        if !s.connection_closed || (s.cargo_pid.is_some() && !s.cargo_exited) {
-            return Vec::new();
+    /// The daemon read `actual` of the `requested` tokens of a
+    /// [`Action::Drain`]; the shortfall, taken by cargo first, is still
+    /// given. Unknown sessions are ignored.
+    pub fn drain_result(&mut self, session: &SessionId, requested: u32, actual: u32) {
+        if let Some(index) = self.index(session) {
+            let s = &mut self.sessions[index];
+            s.given = s.given.saturating_add(requested.saturating_sub(actual));
         }
-        let s = self.sessions.remove(index);
-        let duration_ms = millis(now.saturating_duration_since(s.opened));
-        vec![
-            Action::RemoveFifo {
-                session: s.id.clone(),
-            },
-            Action::Log(EventKind::SessionClosed {
-                session: s.id,
-                tokens_recovered: s.given,
-                duration_ms,
-            }),
-        ]
+    }
+
+    fn index(&self, session: &SessionId) -> Option<usize> {
+        self.sessions.iter().position(|s| &s.id == session)
     }
 }
 

@@ -13,6 +13,9 @@ use crate::account::ProcInfo;
 use crate::classify::Kind;
 use crate::config::{Effective, Priority};
 
+mod lifecycle;
+mod shares;
+
 const GIB: u64 = 1 << 30;
 const START: u64 = 0x6730_0000;
 

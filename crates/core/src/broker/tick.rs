@@ -16,7 +16,8 @@ impl Broker {
     /// In order: accounts each started session's process tree, runs the
     /// policy, releases holds that cleared or timed out, sets each session's
     /// token target and feeds or drains toward it, and every second tick sends
-    /// a heartbeat to every session that has had `Opened`.
+    /// a heartbeat to every session that has had `Opened` and is still
+    /// connected.
     pub fn tick(&mut self, input: &TickInput) -> Vec<Action> {
         let now = input.now;
         let mut actions = std::mem::take(&mut self.startup);
@@ -75,6 +76,7 @@ impl Broker {
         for (index, usage) in owners.into_iter().zip(&accounting.sessions) {
             let s = &mut self.sessions[index];
             s.compiling = usage.compiling;
+            s.has_compiled |= usage.compiling;
             s.test_jobs = usage.test_jobs;
         }
         accounting
@@ -109,10 +111,15 @@ impl Broker {
     }
 
     /// Grants held sessions once the hold clears, or with one thread after
-    /// `max_hold`.
+    /// `max_hold`. Sessions released together split their share of the pool.
     fn release_holds(&mut self, now: Instant, actions: &mut Vec<Action>) {
         let cleared = self.hold.is_none();
-        let threads = self.share_for_new();
+        let mut shares = if cleared {
+            self.shares_for(|s| matches!(s.state, State::Held { .. }))
+        } else {
+            Vec::new()
+        }
+        .into_iter();
         for s in &mut self.sessions {
             let State::Held { since, .. } = s.state else {
                 continue;
@@ -122,7 +129,11 @@ impl Broker {
             if !cleared && !timed_out {
                 continue;
             }
-            let (threads, after_timeout) = if cleared { (threads, false) } else { (1, true) };
+            let (threads, after_timeout) = if cleared {
+                (shares.next().unwrap_or(1), false)
+            } else {
+                (1, true)
+            };
             s.state = State::Granted;
             actions.push(Action::Send {
                 session: s.id.clone(),
@@ -150,16 +161,15 @@ impl Broker {
     /// its tokens as they are this tick.
     fn feed(&mut self, actions: &mut Vec<Action>) {
         let held = self.hold.is_some();
-        let feeding = |s: &Session| s.state == State::Granted && s.compiling;
         let demands: Vec<_> = self
             .sessions
             .iter()
-            .filter(|s| feeding(s))
+            .filter(|s| s.sharing())
             .map(Session::demand)
             .collect();
         let mut slots = allocate(self.session_pool(), &demands).into_iter();
         for s in &mut self.sessions {
-            let share = if feeding(s) { slots.next() } else { None };
+            let share = if s.sharing() { slots.next() } else { None };
             let target = share
                 .filter(|_| !held)
                 .map_or(0, |slots| slots.saturating_sub(1));
@@ -201,28 +211,44 @@ impl Broker {
         self.policy.limit().saturating_sub(test_jobs)
     }
 
-    /// Threads for a session being granted now: its share if it were hungry,
-    /// alongside the compiling sessions, at least 1.
-    pub(super) fn share_for_new(&self) -> u32 {
-        let mut demands: Vec<Demand> = self
-            .sessions
-            .iter()
-            .filter(|s| s.compiling)
-            .map(Session::demand)
-            .collect();
-        demands.push(Demand {
+    /// Threads for the sessions `joining` picks, being granted now: in
+    /// session order, the share each would get if hungry, alongside the
+    /// sharing sessions and those granted but not compiling yet; at least 1.
+    pub(super) fn shares_for(&self, joining: impl Fn(&Session) -> bool) -> Vec<u32> {
+        let waiting = Demand {
             hungry: true,
             outstanding: 0,
-        });
+        };
+        let mut picked = Vec::new();
+        let demands: Vec<Demand> = self
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                let (joins, demand) = if joining(s) {
+                    (true, waiting)
+                } else if s.sharing() {
+                    (false, s.demand())
+                } else if s.about_to_compile() {
+                    (false, waiting)
+                } else {
+                    return None;
+                };
+                picked.push(joins);
+                Some(demand)
+            })
+            .collect();
         allocate(self.session_pool(), &demands)
-            .last()
-            .copied()
-            .unwrap_or(1)
-            .max(1)
+            .into_iter()
+            .zip(picked)
+            .filter_map(|(slots, joins)| joins.then_some(slots.max(1)))
+            .collect()
     }
 
+    /// Sends `Heartbeat` to every session that has had `Opened` and whose
+    /// connection is still open.
     fn heartbeat(&self, actions: &mut Vec<Action>) {
-        for s in self.sessions.iter().filter(|s| s.state != State::Pending) {
+        let listening = |s: &&Session| s.state != State::Pending && !s.connection_closed;
+        for s in self.sessions.iter().filter(listening) {
             actions.push(Action::Send {
                 session: s.id.clone(),
                 msg: ServerMsg::Heartbeat,
