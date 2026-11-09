@@ -1,0 +1,6 @@
+---
+source: crates/cli/src/render/tests.rs
+expression: "render_events(&mixed()[..1], NOW, true)"
+---
+note: older events were omitted (reply too large); narrow the range with --since.
+  2h ago  limit 2 -> 4 (growth); pressure warning, 40% available, swap 3.0 MiB (growing), builds 3.0 GiB, reserve 2.0 GiB

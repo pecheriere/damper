@@ -1,0 +1,5 @@
+---
+source: crates/proto/src/tests/mod.rs
+expression: "String::from_utf8(encode(&events).unwrap()).unwrap()"
+---
+{"v":1,"type":"events","events":[{"ts_ms":5,"type":"limit_changed","from":2,"to":3,"reason":"growth","inputs":{"pressure":"warning","available_pct":40,"swap_used":1048576,"swap_growing":true,"build_footprint":3221225472,"reserve":2147483648}}],"truncated":false}

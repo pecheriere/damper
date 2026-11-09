@@ -1,0 +1,44 @@
+version: 2
+
+# Version updates wait until a release is 7 days old, the age the crate-age
+# check and the action pinning rule require, and minor and patch updates come
+# grouped into one pull request per ecosystem. Security updates skip the
+# cooldown and come one per advisory; a crate release younger than 7 days that
+# fixes an advisory still needs an entry in .github/crate-age-allow.toml.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    commit-message:
+      prefix: ci
+
+  # The ruff version the crate-age job lints its scripts with, pinned by hash
+  # in .github/requirements-lint.txt.
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci

@@ -1,6 +1,6 @@
 # damper: design
 
-Date: 2026-11-08. Status: draft for the owner's approval.
+Date: 2026-11-08. Status: approved by the owner on 2026-11-08. Updated 2026-11-09 with the owner's rulings on the Phase 0 findings (`docs/superpowers/spikes/2026-11-09-phase0-findings.md`).
 
 How to read the tags: `(owner's decision)` and `(owner's idea)` come from the owner. **[call]** is the author's decision, open to override. **[guess]** is an assumption the builder confirms, or a Phase 0 spike settles.
 
@@ -82,13 +82,22 @@ Components:
 3. **The `damper` CLI**: status, log, explain, enable and disable, config check (§7).
 4. **The menu bar app**: Phase 2 (§8).
 
-The shim finds the real cargo by searching `PATH` and skipping its own dir. That way, rustup's proxy and the toolchain it selects keep working. **[call]**
+The shim finds the real cargo by searching `PATH` and skipping its own dir. That way, rustup's proxy and the toolchain it selects keep working. (owner's decision, 2026-11-09, from Phase 0)
+
+- The shim runs the `cargo` it finds exactly as found, with `argv[0]` set to `cargo`. It never resolves that path to the file behind it, and never runs a toolchain's own cargo binary (`rustup which cargo`). rustup's proxy is a link to the `rustup` binary, which decides what to run from the name it was called by. Running the toolchain's cargo directly leaves rustc without a toolchain, and Phase 0 saw that break warden's build with `E0514`.
+- A test covers this: a fake proxy that is a symlink named `cargo` on `PATH` must be the one run, with `argv[0]` set to `cargo`.
 
 ## 5. Build sessions and tokens
 
 ### 5.1 The protocol damper relies on
 
-Cargo and rustc are clients of the GNU make jobserver protocol. If `CARGO_MAKEFLAGS` or `MAKEFLAGS` carries `--jobserver-auth=fifo:<path>`, cargo takes job tokens from that FIFO instead of creating its own pool, and gives them back when jobs finish. Each client may also run one job without a token: the "implicit slot". **[guess]**, that cargo 1.99 honours an inherited FIFO jobserver: Phase 0 confirms it.
+Cargo and rustc are clients of the GNU make jobserver protocol. If `CARGO_MAKEFLAGS` or `MAKEFLAGS` carries `--jobserver-auth=fifo:<path>`, cargo takes job tokens from that FIFO instead of creating its own pool, and gives them back when jobs finish. Each client may also run one job without a token: the "implicit slot". Phase 0 confirmed this on cargo 1.99.1: concurrency is always tokens + 1, cargo picks up new tokens within a second, and every token comes back when the build ends. Cargo honours `CARGO_MAKEFLAGS`, `MAKEFLAGS` and `MFLAGS` alike.
+
+**With sccache as `RUSTC_WRAPPER`** (confirmed in Phase 0, recorded by the owner's decision, 2026-11-09):
+
+- Session tokens limit how many rustc *processes* run. Cargo holds a token for each job while the sccache client waits, so this is the part that bounds memory.
+- rustc's *internal* threads draw on the sccache server's own jobserver, sized to the Mac's core count and shared by every build. sccache strips the jobserver variables before it spawns rustc. damper doesn't limit thread parallelism in that case, and doesn't need to: sccache's pool is already machine-wide.
+- Cache keys ignore `CARGO_MAKEFLAGS`, so a different FIFO path per session doesn't cost cache hits.
 
 ### 5.2 Why one FIFO per session, not one global FIFO
 
@@ -106,7 +115,7 @@ A single global FIFO has no owner tracking. Tokens held by a process that gets k
    - The shim exits with cargo's exit code, or reproduces cargo's death by signal.
 4. **Feed.**
    - `damperd` adds tokens to the session FIFO while the global limit and the session's fair share allow.
-   - It reads the FIFO's fill level (`FIONREAD`) to know how many tokens are outstanding: tokens given minus tokens sitting in the FIFO.
+   - It reads the FIFO's fill level (`FIONREAD`) to know how many tokens are outstanding: tokens given minus tokens sitting in the FIFO. `FIONREAD` must go through a separate `O_RDONLY | O_NONBLOCK` fd: on macOS it always reads 0 on an `O_RDWR` fd of a FIFO. Phase 0 confirmed that the read-only fd reads the right count, doesn't block and takes nothing from cargo. (owner's decision, 2026-11-09)
    - When the limit drops, it stops refilling and drains unused tokens back out.
    - Cargo holds on to tokens between jobs (cargo issue #17391), so tokens already taken come back only as cargo releases them. The policy must allow for that lag (§6.2).
 5. **Close.** The session ends when the shim's connection closes *and* cargo's process is gone.
@@ -122,8 +131,8 @@ A single global FIFO has no owner tracking. Tokens held by a process that gets k
   - The shim detects the case when the inherited `CARGO_MAKEFLAGS` points at a live damper session FIFO, or when a `DAMPER_SESSION` variable set by the outer shim is present. It then passes straight through: no new session, no hold, same FIFO.
   - Subcommands cargo starts through `$CARGO` skip the shim anyway and inherit the FIFO the same way.
   - A nested build is never held, so an outer session can't deadlock waiting on its own inner build. **[call]**
-- **A session counts only while it compiles.** Cargo returns its tokens when compilation ends. For the floor (§5.5) and fairness, a session counts as active only while compiler or linker processes (rustc, the linker, sccache jobs) run in its process tree. A long `cargo run` or a test run therefore doesn't keep a slot. **[call]** Tests are accounted for separately (§5.6).
-- **rust-analyzer's `cargo check` gets a session like any build**, because it uses real memory. But it's never held, only slowed: the shim recognises rust-analyzer as the parent and skips the hold. **[guess]**: the builder confirms a reliable way to recognise it, such as an env var rust-analyzer sets or the parent process name. Without a reliable signal, it's treated as a normal build.
+- **A session counts only while it compiles.** Cargo returns its tokens when compilation ends. For the floor (§5.5) and fairness, a session counts as active only while compiler or linker processes run in its process tree: rustc, the linker, or an sccache client waiting on a compile. With sccache, rustc itself runs under the sccache server, outside the tree (Phase 0), so the client stands for it. A long `cargo run` or a test run therefore doesn't keep a slot. **[call]** Tests are accounted for separately (§5.6).
+- **rust-analyzer's `cargo check` gets a session like any build**, because it uses real memory. But it's never held, only slowed: the daemon recognises rust-analyzer as the shim's parent, by process name, and skips the hold. Confirmed for flycheck in the Phase 1 acceptance (`docs/superpowers/spikes/2026-11-09-acceptance.md`). rust-analyzer's workspace loading (`cargo metadata` and the build-script `cargo check`) calls `~/.cargo/bin/cargo` by absolute path, so it bypasses damper: no session and no QoS.
 
 ### 5.5 Floors
 
@@ -135,7 +144,7 @@ A single global FIFO has no owner tracking. Tokens held by a process that gets k
 - **Test threads come from the session's share.** nextest runs test binaries itself and doesn't use the jobserver. When the shim sees `cargo nextest run` and the user hasn't set `NEXTEST_TEST_THREADS` or `--test-threads`, it sets `NEXTEST_TEST_THREADS` from the session's current share at start. Plain `cargo test` gets the same treatment through `RUST_TEST_THREADS`. **[call]**
 - **Test runs count against the pool.**
   - While test processes run, the session counts as that many jobs. `damperd` sees them in the session's process tree.
-  - Their memory feeds the per-job estimate, since test runs can be where the memory goes.
+  - Their memory counts in the session's measured footprint (§6.2), since test runs can be where the memory goes.
   - The thread count is fixed for that run, so the limit catches up on the next run, not mid-run. **[call]**
 - **A user-set value always wins.**
   - The thread count never drops below 1.
@@ -155,16 +164,21 @@ These are ceilings. The limit inside them is always computed from live state. (o
 
 Inputs, sampled every second or event-driven where macOS offers it. **[call]**
 
-- The system memory-pressure level: a dispatch memory-pressure source, or `kern.memorystatus_vm_pressure_level` (normal, warning, critical).
+- The system memory-pressure level: `kern.memorystatus_vm_pressure_level` (normal, warning, critical), polled every second, plus a dispatch memory-pressure source if it fires in a user agent. Phase 0 confirmed both are readable without privileges, but couldn't make events fire (simulating them needs root), so the polled sysctl is the input the policy relies on. **[call]**
+- `kern.memorystatus_level`, the percentage of memory available.
 - The trend in swap use (`vm.swapusage`) and in the compressor's size.
-- The resident memory of each session's process tree (`proc_pid_rusage`). From that, damper keeps a rolling estimate of memory per job.
+- The physical footprint of the build processes (`proc_pid_rusage`, `ri_phys_footprint`), which works on the user's own processes without privileges. Build processes are every session's process tree *plus* the children of the user's sccache server, because with sccache rustc runs under the server, not under cargo (Phase 0). The policy needs only the total, not a figure per session. **[call]**
 - CPU load is a secondary input only. Utility QoS already makes builds give way to interactive work on CPU.
 
-Policy requirements. The exact constants and formula are left to the builder.
+**Why not an average per job.** Phase 0 measured warden's release build: the median job peaks at 41 MB, the p90 at 120 MB, and one job (the final binary's crate) at 1.3 GB. An average per job either starves the many small jobs or lets the big one through with no room. So the pool is sized by a closed loop on the measured total instead. (owner's decision, 2026-11-09)
 
-- `limit = min(cores, memory headroom ÷ estimated memory per job)`, then reduced by the pressure level.
+Policy requirements. The exact constants are left to the builder.
+
+- **The loop.** Compare the measured total footprint of all sessions against the memory budget (§6.1), and against live pressure and swap.
+- **Grow ahead of the memory.** A job's memory grows after it gets its token, and cargo keeps tokens before giving them back (§5.3), so a loop that only reacts would act too late. damper adds a token only when the memory left in the budget still covers the largest job footprint seen recently. That reserve is a peak that fades over a few minutes, so one big link step doesn't shrink the pool for the rest of the day. (owner's decision, 2026-11-09)
+- **Grow slowly, shrink fast.** Add at most one token per interval. Cut at once when pressure reaches warning or swap is growing. Never raise the limit while swap is growing.
+- The limit never exceeds `cores`.
 - Staying out of critical memory pressure beats throughput. When in doubt, the policy picks the smaller limit. (owner's decision)
-- Grow slowly and shrink fast. Never raise the limit while swap is growing.
 - Share the limit fairly across sessions, so one big workspace build doesn't take every token from later builds.
 - The limit only changes with a reason, which is logged (§7.3) and shown in status.
 
@@ -212,7 +226,7 @@ A hold is never silent:
 - TOML at `~/.config/damper/config.toml`. **[call]** Every key is optional.
 - Keys: `cores`, `memory`, `max_hold`, and an `enabled` default. Values accept absolutes or percentages (`memory = "24GiB"` or `"75%"`).
 - `damperd` reloads the file when it changes. The menu bar app writes the same file.
-- `priority`: `"utility"` (QoS class), `"nice"` or `"none"`. The default comes from the Phase 0 measurement, and the other options stay available. **[call]**
+- `priority`: `"utility"` (QoS class, `taskpolicy -c utility` or its API equivalent), `"nice"` or `"none"`. **The default is `"utility"`.** (owner's decision, 2026-11-09) Phase 0 measured that `nice -n 15` keeps a probe's wake-up latency the same as plain cargo, while utility QoS keeps it at idle level, for builds about 25–35% longer. Background QoS was 5–6 times slower and isn't offered.
 
 ### 7.5 Priority doesn't depend on the broker
 
@@ -228,7 +242,7 @@ The shim lowers cargo's priority by itself, from the config's `priority` key, wh
 
 ## 9. Phases
 
-0. **Spikes (throwaway, before any product code)**:
+0. **Spikes (throwaway, before any product code)**. Done on 2026-11-09, see `docs/superpowers/spikes/2026-11-09-phase0-findings.md`. Nothing refuted the design. The owner's rulings on the five changes it proposed are folded into §4, §5.1, §5.3, §6.2, §7.4 and §11. Still unverified: memory-pressure events firing in a user agent under real pressure, which the Phase 1 acceptance test covers.
    - Cargo 1.99 honours an inherited FIFO jobserver, and the job count follows the tokens fed in, live.
    - **sccache stays correct under it.** sccache runs rustc from its own long-lived server process. Confirm that rustc's parallelism still follows the session's tokens, and that cache hits are unchanged. If sccache breaks the scheme, stop and bring it back to the owner: the design changes.
    - The `FIONREAD` accounting on a macOS FIFO works as §5.3 assumes.
@@ -252,7 +266,7 @@ On the owner's Mac (M4, 10 cores, 32 GB), start 5 full workspace builds of a rea
   - memory pressure never stays critical for more than a short spike;
   - the Mac stays responsive to interactive use;
   - all 5 builds pass.
-- **With damper, goal only:** total wall time no worse than the baseline. When responsiveness and wall time conflict, responsiveness wins: damper may make a batch take longer to keep the Mac usable. (owner's decision) Record the wall time in both runs either way.
+- **With damper, not a gate:** record the total wall time in both runs. Builds will be slower: utility QoS alone cost about 25–35% in Phase 0, and damper may also hold builds back. That's expected and accepted, because responsiveness and staying out of critical pressure win over wall time. (owner's decision, 2026-11-09) Flag it for the owner if the batch takes more than twice the baseline. **[call]**
 - **Fail-open checks:** kill `damperd` mid-run; SIGKILL a shim; SIGKILL a cargo; break the config. Every build still finishes or fails exactly as cargo would, and `damper log` explains each event.
 
 ## 12. Left to the builder

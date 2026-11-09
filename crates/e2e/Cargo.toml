@@ -1,0 +1,33 @@
+[package]
+name = "damper-e2e"
+description = "End-to-end tests for damper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# One test binary, `tests/e2e.rs`, with the harness and the suites as its
+# modules, so the harness isn't built as a test target of its own.
+autotests = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "fake-cargo"
+path = "src/bin/fake-cargo.rs"
+test = false
+
+[[test]]
+name = "e2e"
+path = "tests/e2e.rs"
+
+[dependencies]
+nix = { version = "0.31.3", features = ["poll", "fs", "signal", "process"] }
+
+[dev-dependencies]
+damper-proto = { version = "0.1.0", path = "../proto" }
+rustix = "1.1.6"
+serde_json = "1.0.154"
+tempfile = "3.27.0"

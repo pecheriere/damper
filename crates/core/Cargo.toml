@@ -1,0 +1,19 @@
+[package]
+name = "damper-core"
+description = "Memory-pressure policy and accounting for damper."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+damper-proto = { version = "0.1.0", path = "../proto" }
+thiserror = "2.0.21"
+toml = "1.2.1"
+
+[dev-dependencies]
+proptest = "1.12.0"

@@ -14,7 +14,7 @@
 
 - Spike scripts live in the session scratchpad, never in the repo. Only `docs/superpowers/spikes/2026-11-09-phase0-findings.md` is committed.
 - Build files stay on the external SSD, which the global `build-dir` handles automatically. Never set `CARGO_TARGET_DIR` or any other `CARGO_*` variable to choose a location. Use `--target-dir` on the SSD only if a one-off dir is unavoidable.
-- When done, delete the SSD build dirs the spikes created (`/Volumes/External SSD/cargo-build/<hash>` for the generated workspace and any scratch warden worktree).
+- When done, delete the SSD build dirs the spikes created (`<ssd>/cargo-build/<hash>` for the generated workspace and any scratch warden worktree).
 - Don't run `sccache --stop-server` while other builds are running. Check `procs cargo` first. `sccache --zero-stats` is fine.
 - Run the measurements only while no other heavy builds are running. Check `procs rustc` before each measured run.
 - Never print process environments: use anchored exact-name checks only.
@@ -113,7 +113,7 @@ Measurement pitfalls that would give a wrong answer:
   - what it changes in the design, if anything.
   - At the end, a list of design changes for the owner to rule on. If S2 refuted the design, that list leads.
 
-- [ ] **Step 2:** Delete the spike SSD build dirs. Find them by the workspace paths under `$S`. Confirm with `dust -d 1 "/Volumes/External SSD/cargo-build"` before and after.
+- [ ] **Step 2:** Delete the spike SSD build dirs. Find them by the workspace paths under `$S`. Confirm with `dust -d 1 "<ssd>/cargo-build"` before and after.
 - [ ] **Step 3:** Commit.
 
 ```bash

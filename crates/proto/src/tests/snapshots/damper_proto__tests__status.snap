@@ -1,0 +1,5 @@
+---
+source: crates/proto/src/tests/mod.rs
+expression: "String::from_utf8(encode(&status).unwrap()).unwrap()"
+---
+{"v":1,"type":"status","limit":6,"reason":"headroom","cores":10,"memory":34359738368,"inputs":{"pressure":"warning","available_pct":40,"swap_used":1048576,"swap_growing":true,"build_footprint":3221225472,"reserve":2147483648},"holding":false,"sessions":[{"session":"6543-1","cwd":"/work/demo","subcommand":"build","state":{"held":{"waited_secs":4}},"slots":2,"tokens_outstanding":1,"age_secs":12}],"warnings":["w"]}
