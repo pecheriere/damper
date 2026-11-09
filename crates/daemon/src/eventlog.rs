@@ -6,7 +6,7 @@
 //! through a symlink.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,54 +170,88 @@ impl EventLog {
     }
 
     /// Moves the shim's fallback records from `path` into the log and returns
-    /// how many there were.
+    /// how many there were, reading about `budget` bytes at most.
     ///
     /// Each line of `path` is one [`Event`] whose kind is
     /// [`EventKind::ShimFallback`], stamped by the shim; its time is kept.
     /// Other lines are skipped, so the shim's file cannot forge other events.
     /// The file is first renamed to `<path>.ingest` so that a shim appending
     /// meanwhile starts a new file instead of losing its line; a `.ingest`
-    /// file left by an interrupted run is taken first. Lines longer than
+    /// file left by an earlier run is taken first. Lines longer than
     /// [`MAX_LINE`] are skipped. A file that can't be opened or read is
     /// logged as `Error` and renamed to `<path>.bad`, and ingesting carries
     /// on, so a bad leftover cannot fail every start.
     ///
+    /// Reading stops at the first line end at or past `budget` bytes, so a
+    /// large file cannot stall the caller. The rest stays in `.ingest`, and
+    /// how far it was read is kept in `<path>.ingest.pos`, so the next run
+    /// (in this daemon or the next) carries on where this one stopped. A run
+    /// interrupted between appending and recording its position takes those
+    /// lines again: a record may be logged twice, never lost.
+    ///
     /// # Errors
-    /// Failure to rename or remove the file, or to append.
-    pub fn ingest_fallbacks(&mut self, path: &Path) -> io::Result<u32> {
+    /// Failure to rename, remove or write the files, or to append.
+    pub fn ingest_fallbacks(&mut self, path: &Path, budget: u64) -> io::Result<u32> {
         let with_suffix = |suffix: &str| {
             let mut name = path.as_os_str().to_owned();
             name.push(suffix);
             PathBuf::from(name)
         };
-        let taking = with_suffix(".ingest");
-        let bad = with_suffix(".bad");
-        let leftover = self.ingest_file(&taking, &bad)?;
-        match fs::rename(path, &taking) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(leftover),
+        let files = IngestFiles {
+            taking: with_suffix(".ingest"),
+            pos: with_suffix(".ingest.pos"),
+            bad: with_suffix(".bad"),
+        };
+        let leftover = self.ingest_file(&files, budget)?;
+        if !leftover.finished || leftover.read >= budget {
+            return Ok(leftover.count);
+        }
+        // No `.ingest` is left, so any position is stale.
+        remove_if_exists(&files.pos)?;
+        match fs::rename(path, &files.taking) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(leftover.count),
             other => other?,
         }
-        Ok(leftover.saturating_add(self.ingest_file(&taking, &bad)?))
+        let rest = self.ingest_file(&files, budget - leftover.read)?;
+        Ok(leftover.count.saturating_add(rest.count))
     }
 
-    /// Ingests and removes `path`, if it exists. A file that can't be read
-    /// is logged and renamed to `bad`, so it cannot stop every later start.
-    fn ingest_file(&mut self, path: &Path, bad: &Path) -> io::Result<u32> {
-        let file = match open_read(path) {
-            Ok(None) => return Ok(0),
+    /// Ingests `files.taking` from its recorded position, if it exists, up to
+    /// `budget` bytes. Removes it once read to the end, or records how far it
+    /// got. A file that can't be read is logged and renamed to `files.bad`,
+    /// so it cannot stop every later start.
+    fn ingest_file(&mut self, files: &IngestFiles, budget: u64) -> io::Result<Taken> {
+        let mut file = match open_read(&files.taking) {
+            Ok(None) => return Ok(Taken::NOTHING),
             Ok(Some(file)) => file,
-            Err(e) => return self.set_aside(path, bad, &e),
+            Err(e) => return self.set_aside(files, &e),
         };
-        let count = match self.take_fallbacks(file) {
-            Ok(count) => count,
-            Err(IngestError::Read(e)) => return self.set_aside(path, bad, &e),
+        let start = read_pos(&files.pos);
+        if let Err(e) = file.seek(SeekFrom::Start(start)) {
+            return self.set_aside(files, &e);
+        }
+        let (count, progress) = match self.take_fallbacks(file, budget) {
+            Ok(taken) => taken,
+            Err(IngestError::Read(e)) => return self.set_aside(files, &e),
             Err(IngestError::Write(e)) => return Err(e),
         };
-        fs::remove_file(path)?;
-        Ok(count)
+        if progress.eof {
+            // The position goes first: losing it re-reads, never skips.
+            remove_if_exists(&files.pos)?;
+            fs::remove_file(&files.taking)?;
+        } else {
+            write_pos(&files.pos, start.saturating_add(progress.read))?;
+        }
+        Ok(Taken {
+            count,
+            read: progress.read,
+            finished: progress.eof,
+        })
     }
 
-    fn set_aside(&mut self, path: &Path, bad: &Path, cause: &io::Error) -> io::Result<u32> {
+    fn set_aside(&mut self, files: &IngestFiles, cause: &io::Error) -> io::Result<Taken> {
+        remove_if_exists(&files.pos)?;
+        let (path, bad) = (&files.taking, &files.bad);
         let message = match fs::rename(path, bad) {
             Ok(()) => format!(
                 "reading {}: {cause}; moved it to {}",
@@ -230,12 +264,12 @@ impl EventLog {
             ),
         };
         self.append(EventKind::Error { message })?;
-        Ok(0)
+        Ok(Taken::NOTHING)
     }
 
-    fn take_fallbacks(&mut self, file: File) -> Result<u32, IngestError> {
+    fn take_fallbacks(&mut self, file: File, budget: u64) -> Result<(u32, Progress), IngestError> {
         let mut count: u32 = 0;
-        for_each_line(BufReader::new(file), MAX_LINE, |line| {
+        let progress = for_each_line(BufReader::new(file), MAX_LINE, budget, |line| {
             if let Ok(event) = serde_json::from_slice::<Event>(line)
                 && matches!(event.kind, EventKind::ShimFallback { .. })
             {
@@ -244,7 +278,72 @@ impl EventLog {
             }
             Ok(())
         })?;
-        Ok(count)
+        Ok((count, progress))
+    }
+}
+
+/// The files of one fallback ingest.
+struct IngestFiles {
+    /// The fallback file being read, renamed from the shims'.
+    taking: PathBuf,
+    /// How far `taking` has been read, in bytes, as decimal text.
+    pos: PathBuf,
+    /// Where an unreadable `taking` is moved.
+    bad: PathBuf,
+}
+
+/// What one pass over a fallback file took.
+struct Taken {
+    /// Fallback records appended to the log.
+    count: u32,
+    /// Bytes read.
+    read: u64,
+    /// The file was read to its end and removed, or was not there.
+    finished: bool,
+}
+
+impl Taken {
+    const NOTHING: Self = Self {
+        count: 0,
+        read: 0,
+        finished: true,
+    };
+}
+
+/// The recorded read position; 0 when there is none. An unreadable or
+/// garbled position also reads as 0: records may then be logged twice, but
+/// none is lost.
+fn read_pos(path: &Path) -> u64 {
+    let mut text = String::new();
+    match open_read(path) {
+        Ok(Some(file)) => match file.take(32).read_to_string(&mut text) {
+            Ok(_) => text.trim().parse().unwrap_or(0),
+            Err(_) => 0,
+        },
+        Ok(None) | Err(_) => 0,
+    }
+}
+
+/// Records the read position atomically: written aside, then renamed over.
+fn write_pos(path: &Path, pos: u64) -> io::Result<()> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".tmp");
+    let tmp = PathBuf::from(name);
+    remove_if_exists(&tmp)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    file.write_all(pos.to_string().as_bytes())?;
+    fs::rename(&tmp, path)
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -257,16 +356,27 @@ enum IngestError {
     Write(io::Error),
 }
 
+/// How far [`for_each_line`] read.
+struct Progress {
+    /// Bytes consumed.
+    read: u64,
+    /// The reader was read to its end.
+    eof: bool,
+}
+
 /// Calls `f` with every line of `reader` that, with its newline, is at most
 /// `max` bytes (passed without the newline). Longer lines are skipped
-/// without ever buffering more than `max + 1` bytes of them.
+/// without ever buffering more than `max + 1` bytes of them. Stops at the
+/// first line end at or past `budget` bytes, so at least one line is read.
 fn for_each_line(
     mut reader: impl BufRead,
     max: usize,
+    budget: u64,
     mut f: impl FnMut(&[u8]) -> io::Result<()>,
-) -> Result<(), IngestError> {
+) -> Result<Progress, IngestError> {
     let mut line = Vec::new();
     let mut skipping = false;
+    let mut read: u64 = 0;
     loop {
         let available = match reader.fill_buf() {
             Ok(available) => available,
@@ -278,7 +388,7 @@ fn for_each_line(
             if !skipping && !line.is_empty() {
                 f(&line).map_err(IngestError::Write)?;
             }
-            return Ok(());
+            return Ok(Progress { read, eof: true });
         }
         let (take, done) = match available.iter().position(|&b| b == b'\n') {
             Some(i) => (i + 1, true),
@@ -293,6 +403,7 @@ fn for_each_line(
             }
         }
         reader.consume(take);
+        read = read.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
         if done {
             if !skipping {
                 line.pop();
@@ -300,6 +411,9 @@ fn for_each_line(
             }
             line.clear();
             skipping = false;
+            if read >= budget {
+                return Ok(Progress { read, eof: false });
+            }
         }
     }
 }

@@ -110,7 +110,7 @@ fn ingest_fallbacks_moves_entries() {
     append_raw(&fallbacks, shim_line(7, "connect timeout").as_bytes());
 
     let mut log = EventLog::open(dir.path()).unwrap();
-    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 2);
+    assert_eq!(log.ingest_fallbacks(&fallbacks, u64::MAX).unwrap(), 2);
     assert!(!fallbacks.exists());
     let events = log.read(None).unwrap();
     let reasons: Vec<(u64, String)> = events
@@ -131,7 +131,7 @@ fn ingest_fallbacks_moves_entries() {
         ]
     );
     // Nothing left to ingest the second time.
-    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 0);
+    assert_eq!(log.ingest_fallbacks(&fallbacks, u64::MAX).unwrap(), 0);
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn an_unreadable_leftover_is_set_aside_and_ingest_carries_on() {
     append_raw(&fallbacks, shim_line(5).as_bytes());
 
     let mut log = EventLog::open(dir.path()).unwrap();
-    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 1);
+    assert_eq!(log.ingest_fallbacks(&fallbacks, u64::MAX).unwrap(), 1);
     assert!(
         dir.path()
             .join("fallbacks.jsonl.bad")
@@ -195,7 +195,7 @@ fn an_unreadable_leftover_is_set_aside_and_ingest_carries_on() {
             .any(|e| matches!(e.kind, EventKind::ShimFallback { .. }) && e.ts_ms == 5)
     );
     // The next start is not stuck on it.
-    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 0);
+    assert_eq!(log.ingest_fallbacks(&fallbacks, u64::MAX).unwrap(), 0);
 }
 
 #[test]
@@ -211,7 +211,71 @@ fn ingest_skips_lines_longer_than_max_line() {
     append_raw(&fallbacks, shim_line(3).as_bytes());
 
     let mut log = EventLog::open(dir.path()).unwrap();
-    assert_eq!(log.ingest_fallbacks(&fallbacks).unwrap(), 2);
+    assert_eq!(log.ingest_fallbacks(&fallbacks, u64::MAX).unwrap(), 2);
     let stamps: Vec<u64> = log.read(None).unwrap().iter().map(|e| e.ts_ms).collect();
     assert_eq!(stamps, [1, 3]);
+}
+
+fn fallback_line(n: u32) -> String {
+    format!("{{\"ts_ms\":{n},\"type\":\"shim_fallback\",\"reason\":\"r{n}\",\"cwd\":\"/w\"}}\n")
+}
+
+fn fallback_times(log: &EventLog) -> Vec<u64> {
+    log.read(None)
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ShimFallback { .. }))
+        .map(|e| e.ts_ms)
+        .collect()
+}
+
+#[test]
+fn a_bounded_ingest_leaves_the_rest_for_the_next_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let fallbacks = dir.path().join("fallbacks.jsonl");
+    for n in 0..40 {
+        append_raw(&fallbacks, fallback_line(n).as_bytes());
+    }
+    let line = u64::try_from(fallback_line(0).len()).unwrap();
+    let mut log = EventLog::open(dir.path()).unwrap();
+
+    // Each run reads whole lines up to about the budget, never all 40.
+    let first = log.ingest_fallbacks(&fallbacks, 10 * line).unwrap();
+    assert!((10..40).contains(&first), "first run took {first}");
+    // A shim appends while the rest waits; it comes after the rest.
+    append_raw(&fallbacks, fallback_line(40).as_bytes());
+    let mut total = first;
+    for _ in 0..10 {
+        total += log.ingest_fallbacks(&fallbacks, 10 * line).unwrap();
+    }
+    assert_eq!(total, 41);
+    assert_eq!(fallback_times(&log), (0..=40).collect::<Vec<u64>>());
+    let left: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("fallbacks"))
+        .collect();
+    assert_eq!(left, Vec::<String>::new());
+}
+
+#[test]
+fn a_restart_resumes_a_bounded_ingest_without_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let fallbacks = dir.path().join("fallbacks.jsonl");
+    for n in 0..30 {
+        append_raw(&fallbacks, fallback_line(n).as_bytes());
+    }
+    let line = u64::try_from(fallback_line(0).len()).unwrap();
+    let first = EventLog::open(dir.path())
+        .unwrap()
+        .ingest_fallbacks(&fallbacks, 5 * line)
+        .unwrap();
+    assert!(first < 30);
+    // A new daemon takes the rest at start, unbounded.
+    let mut log = EventLog::open(dir.path()).unwrap();
+    assert_eq!(
+        log.ingest_fallbacks(&fallbacks, u64::MAX).unwrap(),
+        30 - first
+    );
+    assert_eq!(fallback_times(&log), (0..30).collect::<Vec<u64>>());
 }

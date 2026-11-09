@@ -11,6 +11,10 @@ use crate::eventlog::EventLog;
 
 /// Ticks between two ingests.
 pub(crate) const INGEST_EVERY: u64 = 5;
+/// Bytes one ingest reads at most (about 5,000 records), so a large file
+/// cannot stall the tick, and with it the heartbeats; the rest waits for the
+/// next ingest.
+pub(crate) const INGEST_BUDGET: u64 = 1 << 20;
 
 /// The shims' fallback file and the log it is moved into.
 pub(crate) struct Fallbacks {
@@ -44,7 +48,7 @@ impl Fallbacks {
             events
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .ingest_fallbacks(&path)
+                .ingest_fallbacks(&path, INGEST_BUDGET)
         })
     }
 
@@ -70,7 +74,7 @@ mod tests {
 
     use damper_proto::EventKind;
 
-    use super::{Fallbacks, INGEST_EVERY};
+    use super::{Fallbacks, INGEST_BUDGET, INGEST_EVERY};
     use crate::eventlog::EventLog;
 
     #[test]
@@ -96,6 +100,37 @@ mod tests {
             [e] if matches!(&e.kind, EventKind::ShimFallback { reason, .. } if reason == "fed")
         ));
         assert!(fallbacks.job().is_none());
+    }
+
+    #[test]
+    fn one_ingest_reads_at_most_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(EventLog::open(dir.path()).unwrap()));
+        let path = dir.path().join("fallbacks.jsonl");
+        let line = |n: u32| {
+            format!(
+                "{{\"ts_ms\":{n},\"type\":\"shim_fallback\",\"reason\":\"r\",\"cwd\":\"/w\"}}\n"
+            )
+        };
+        let size = u64::try_from(line(0).len()).unwrap();
+        // Twice the budget's worth of records (same length: ts_ms ≥ 10⁴).
+        let total = u32::try_from(2 * INGEST_BUDGET / size).unwrap();
+        let text: String = (10_000..10_000 + total).map(line).collect();
+        std::fs::write(&path, text).unwrap();
+
+        let mut fallbacks = Fallbacks::new(Arc::clone(&events), path);
+        let mut runs = Vec::new();
+        while runs.iter().sum::<u32>() < total {
+            assert!(runs.len() < 4, "runs: {runs:?}");
+            for _ in 1..INGEST_EVERY {
+                assert!(fallbacks.job().is_none());
+            }
+            let job = fallbacks.job().unwrap();
+            runs.push(job().unwrap());
+        }
+        let per_run = u32::try_from(INGEST_BUDGET.div_ceil(size)).unwrap();
+        assert!(runs.iter().all(|&n| n <= per_run), "runs: {runs:?}");
+        assert_eq!(runs.len(), 3, "runs: {runs:?}");
     }
 
     #[test]

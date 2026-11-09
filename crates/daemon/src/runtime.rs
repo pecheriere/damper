@@ -156,7 +156,7 @@ pub async fn run_until(
         let message = format!("removing stale FIFO {}: {e}", path.display());
         log.send(EventKind::Error { message }).ok();
     }
-    if let Err(e) = eventlog.ingest_fallbacks(&paths.log.join(FALLBACKS)) {
+    if let Err(e) = eventlog.ingest_fallbacks(&paths.log.join(FALLBACKS), u64::MAX) {
         let message = format!("ingesting shim fallbacks: {e}");
         log.send(EventKind::Error { message }).ok();
     }
