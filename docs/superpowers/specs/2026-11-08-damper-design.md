@@ -132,7 +132,7 @@ A single global FIFO has no owner tracking. Tokens held by a process that gets k
   - Subcommands cargo starts through `$CARGO` skip the shim anyway and inherit the FIFO the same way.
   - A nested build is never held, so an outer session can't deadlock waiting on its own inner build. **[call]**
 - **A session counts only while it compiles.** Cargo returns its tokens when compilation ends. For the floor (§5.5) and fairness, a session counts as active only while compiler or linker processes run in its process tree: rustc, the linker, or an sccache client waiting on a compile. With sccache, rustc itself runs under the sccache server, outside the tree (Phase 0), so the client stands for it. A long `cargo run` or a test run therefore doesn't keep a slot. **[call]** Tests are accounted for separately (§5.6).
-- **rust-analyzer's `cargo check` gets a session like any build**, because it uses real memory. But it's never held, only slowed: the shim recognises rust-analyzer as the parent and skips the hold. **[guess]**: the builder confirms a reliable way to recognise it, such as an env var rust-analyzer sets or the parent process name. Without a reliable signal, it's treated as a normal build.
+- **rust-analyzer's `cargo check` gets a session like any build**, because it uses real memory. But it's never held, only slowed: the daemon recognises rust-analyzer as the shim's parent, by process name, and skips the hold. Confirmed for flycheck in the Phase 1 acceptance (`docs/superpowers/spikes/2026-11-09-acceptance.md`). rust-analyzer's workspace loading (`cargo metadata` and the build-script `cargo check`) calls `~/.cargo/bin/cargo` by absolute path, so it bypasses damper: no session and no QoS.
 
 ### 5.5 Floors
 
