@@ -41,7 +41,8 @@ The goal of damper as a whole is to make full use of the Mac's CPU and memory wi
 - **Release signing key: the owner's on-disk git signing key, for now.** This is the same key warden uses: warden's `docs/release-signers`, the tap's `release-signers` and the tap's `maintainer-signers` all list the key that git's `user.signingkey` names. (owner's decision, 2026-11-09) Because it is git's default signing key, `git tag -s` signs the tag with it and `sign-release.sh` can default to it, exactly as warden's does. The signers entry carries `namespaces="git,damper-release"`, so one entry covers the tag and the manifest.
   - **Accepted risk (owner's decision):** anything running as the owner can use this key, agents included, so a signature isn't proof that the owner approved a release. Approval rests on the rule that only the owner tags and signs releases. A GitHub environment approval wouldn't close this gap: the same user token can approve a deployment through the API. The owner plans to move release signing to a key that asks each time, once warden can broker it. That move is a key rotation (new key in both signers files) and changes nothing else in this design.
 - **Immutable releases** are on for the repo, so the signed manifest must be uploaded to the draft before publishing, as with warden. (repo setting)
-- **crate-age.** The release workflow gates on CI and crate-age, as warden's does. PR #1 merged with 9 versions that hadn't yet aged 7 days. They clear by 2026-11-16, so the first release can't be tagged before then. (fact)
+- **crate-age.** The release workflow gates on CI and crate-age, as warden's does. warden's release job checks every version added since the previous release tag, and all of them when there is none. PR #1 merged with 9 versions that hadn't yet aged 7 days, under a recorded owner override (PR #1 comment). They clear by 2026-11-16. The first release may go out before then. (owner's decision, 2026-11-09) Mechanism **[call]**: when there's no previous tag, the release job compares against the commit where PR #1 merged (`2cf5202`), not the empty tree, with a comment linking the override. Versions added after that merge are still checked. The allow-list can't be used, because it only takes advisory fixes.
+- **No publish job, so no environment reviewer.** The public-repo baseline puts publish jobs behind a GitHub environment with a required reviewer. This workflow never publishes: it leaves a draft, and the owner publishes it by hand after signing. So there's no publish job to gate. (owner's decision: one approval)
 
 ## 5. Design
 
@@ -124,6 +125,6 @@ The main spec already covers this (row "`brew upgrade` during builds"): running 
 
 ## 8. Needs the owner (not agent work)
 
-- Tag, sign and publish the first release, on or after 2026-11-16 (crate-age).
+- Tag, sign and publish the first release.
 - Approve the tap ruleset change that makes the damper check jobs required (§5.3). Agents make the change only after that approval.
 - The first `Formula/damper.rb`: the tap's `AGENTS.md` has the maintainer commit a project's first formula. `maintainer-signers` lists the on-disk key, so this is a policy step, not a technical one. The owner either commits it or tells the agent to.
