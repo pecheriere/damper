@@ -286,8 +286,7 @@ Separate worktree, branch `feat/damper-formula`. Read the tap's `AGENTS.md` firs
   - `test_damper_refuses_key_not_in_damper_signers`, including warden's own signers file: the namespaces must not cross
   - `test_damper_refuses_downgrade`
   - `test_warden_output_unchanged`: the existing warden golden still matches with no `--project`
-
-  In `test_scope.py`: `test_damper_bump_is_in_scope`.
+  - in `test_scope.py`: `test_damper_bump_is_in_scope`
 - [ ] **Step 2:** Run `python3 -I -m unittest discover -s scripts -p 'test_*.py'`. Expected: the new tests FAIL.
 - [ ] **Step 3:** Implement: a small `Project` dataclass table in `formula.py`, with no behaviour change for warden. Keep the file under 800 lines; if it grows past ~400, move the templates into `scripts/formula_templates.py`.
 - [ ] **Step 4:** Run the same command. Expected: PASS.
