@@ -20,10 +20,27 @@ The design is in `docs/superpowers/specs/2026-11-08-damper-design.md`.
 | `crates/cli` | `damper` | The control CLI (bin) |
 | `crates/e2e` | `damper-e2e` | End-to-end tests, never published |
 
+## Tracking work: beads
+
+Work in this repository is tracked with [beads](https://github.com/gastownhall/beads)
+(`bd`), prefix `dmp-`, not GitHub issues. Pull requests name the bead they
+deliver. GitHub issues stay open for outside reports: each one is triaged into
+a bead, which links to it.
+
+- `bd prime` loads the workflow; `bd ready` lists work with no blockers.
+- Create a bead before starting work, claim it (`bd update <id> --claim`) and
+  close it when the change merges.
+- No markdown TODO lists or memory files: use beads, and `bd remember` for
+  durable project knowledge.
+
+The database runs as a local Dolt server that `bd` starts on demand. Its data
+lives in `.beads/` in the main checkout and is never committed: worktrees use
+the main checkout's database.
+
 ## Ground rules
 
 - **Do it right the first time.** No shortcuts, no `TODO` comments: do the work
-  now or open an issue. No dead code.
+  now or track it as a bead. No dead code.
 - **No unsafe.** `unsafe_code = "forbid"` in every crate. Syscalls go through a
   safe wrapper or a system tool. If none exists, stop and ask.
 - **No silenced lints.** No `#[allow(...)]` or `#[expect(...)]` without a
@@ -65,6 +82,7 @@ names or account names. Examples and tests use generic names only.
 - Commits are signed and signed off (`git commit -s`). Never bypass signing or
   hooks.
 - No AI attribution lines in commits or pull request descriptions.
-- One branch and one pull request per issue. Say in the pull request what was
+- One branch and one pull request per bead (or per GitHub issue from an
+  outside reporter). Say in the pull request what was
   verified locally and what only CI ran.
 - Conventional subjects (`feat:`, `fix:`, `chore:`, `docs:`).
