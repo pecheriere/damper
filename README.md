@@ -1,5 +1,7 @@
 # damper
 
+[![CI on main](https://github.com/pecheriere/damper/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pecheriere/damper/actions/workflows/ci.yml?query=branch%3Amain)
+
 damper is a macOS broker that sizes a machine-wide cargo jobserver pool from
 memory pressure, so parallel builds slow down before the machine does.
 

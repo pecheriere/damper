@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Merges by bots start no push workflow and main does not require branches to
+  # be up to date, so this daily run catches a broken main within a day.
+  schedule:
+    - cron: "47 4 * * *"
+  # A caller must grant issues: write, for report-red-main, even though a call
+  # from anything but main skips it: GitHub refuses to start it otherwise.
   workflow_call:
 
 permissions:
@@ -80,3 +86,34 @@ jobs:
           python3 -I -m unittest discover -s scripts/acceptance -p 'test_*.py'
       - name: Refuse crate versions published less than 7 days ago
         run: python3 -I .github/scripts/crate_age.py --base HEAD^1
+
+  # A failed run on main only tells whoever reads the notification, so keep one
+  # issue open while main is red. It links the run, and the run holds the details.
+  report-red-main:
+    needs: [lint, test, crate-age]
+    if: >-
+      always() && (github.event_name == 'push' || github.event_name == 'schedule')
+      && github.ref == 'refs/heads/main'
+      && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write # to open or comment on the one issue
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          title="CI failed on main"
+          number=$(gh issue list --state open --search "in:title \"$title\"" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "Still failing at $COMMIT: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "Failed at $COMMIT: $RUN_URL
+
+          Fix main before merging anything else, and close this issue once main's CI passes."
+          fi
