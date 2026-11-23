@@ -24,7 +24,7 @@ name = "e2e"
 path = "tests/e2e.rs"
 
 [dependencies]
-nix = { version = "0.31.3", features = ["poll", "fs", "signal", "process"] }
+nix = { version = "0.32.0", features = ["poll", "fs", "signal", "process"] }
 
 [dev-dependencies]
 damper-proto = { version = "0.1.0", path = "../proto" }
